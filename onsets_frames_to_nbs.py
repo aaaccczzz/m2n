@@ -6,7 +6,7 @@
 NBS 格式統一對齊 mp3_to_nbs.py 的 build_nbs_bytes()。
 """
 from __future__ import annotations
-import argparse, io, os, struct, subprocess, sys, tempfile, urllib.request, wave
+import argparse, contextlib, io, os, shutil, struct, subprocess, sys, tempfile, urllib.request, wave
 from dataclasses import dataclass
 import numpy as np
 
@@ -65,17 +65,24 @@ def download_model(path):
         except OSError: pass
         raise RuntimeError(f"模型下載失敗：{e}")
 
-def get_interpreter(model_path):
+def get_interpreter(model_path, num_threads=None):
     """取得 TFLite/LiteRT interpreter。
 
     優先使用新版 ai-edge-litert，因為它提供 Python 3.13 + Windows
     x86-64 的 wheel；其次才嘗試 TensorFlow 與舊版 tflite-runtime。
     這樣整個專案可以維持 Python 3.13，不需要為了這個模型退回 3.11。
+
+    num_threads：CPU 推理執行緒數。None 時用 min(8, CPU核心)。
+    多 worker 平行時，每顆 interpreter 應給較小的 num_threads，
+    避免總執行緒數超過核心數造成過度訂閱。
     """
     errors = []
 
     # 目前推薦的獨立 LiteRT runtime。
-    num_threads = max(1, min(8, os.cpu_count() or 4))
+    if num_threads is None:
+        num_threads = max(1, min(8, os.cpu_count() or 4))
+    else:
+        num_threads = max(1, int(num_threads))
 
     try:
         from ai_edge_litert.interpreter import Interpreter
@@ -109,9 +116,206 @@ def get_interpreter(model_path):
         "嘗試結果：\n  - " + "\n  - ".join(errors)
     )
 
+@contextlib.contextmanager
+def _suppress_stderr_fd():
+    """暫時把 C 層 stderr（fd 2）導向 os.devnull。
+
+    LiteRT / Dawn 初始化會直接對 fd 2 印大量 INFO 噪音，
+    Python 層的 redirect_stderr 攔不到。任何步驟失敗就直接放行。
+    """
+    try:
+        sys.stderr.flush()
+    except Exception:
+        pass
+    saved = None
+    devnull = None
+    try:
+        devnull = os.open(os.devnull, os.O_WRONLY)
+        saved = os.dup(2)
+        os.dup2(devnull, 2)
+    except OSError:
+        pass
+    try:
+        yield
+    finally:
+        if saved is not None:
+            try:
+                os.dup2(saved, 2)
+            except OSError:
+                pass
+            os.close(saved)
+        if devnull is not None:
+            os.close(devnull)
+
+
+def ensure_webgpu_runtime_dlls():
+    """把 tools/dxc 的 DXC DLL 複製到 LiteRT 套件目錄（WebGPU 著色器編譯用）。
+
+    Dawn（WebGPU backend）在自己的模組目錄搜尋 dxil.dll /
+    dxcompiler.dll；把檔案放進 site-packages/ai_edge_litert 是實測
+    有效的做法（設定 PATH 無效）。目標已存在就跳過。
+    回傳 None 代表就緒，否則回傳錯誤訊息（不丟例外）。
+    """
+    try:
+        import ai_edge_litert
+    except Exception as e:
+        return f"ai_edge_litert 未安裝：{e}"
+
+    pkg_dir = os.path.dirname(os.path.abspath(ai_edge_litert.__file__))
+    src_dir = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "tools", "dxc"
+    )
+    if not os.path.isdir(src_dir):
+        if os.path.isfile(os.path.join(pkg_dir, "dxil.dll")):
+            return None
+        return f"找不到 {src_dir}，且套件目錄沒有 dxil.dll"
+
+    copied = []
+    for name in sorted(os.listdir(src_dir)):
+        if not name.lower().endswith(".dll"):
+            continue
+        dst = os.path.join(pkg_dir, name)
+        if os.path.isfile(dst):
+            continue
+        try:
+            shutil.copy2(os.path.join(src_dir, name), dst)
+            copied.append(name)
+        except OSError as e:
+            return f"複製 {name} 失敗：{e}"
+    if copied:
+        print(f"  WebGPU：已複製 {', '.join(copied)} → {pkg_dir}")
+    return None
+
+
+class WebGPUOFModel:
+    """LiteRT CompiledModel（WebGPU / D3D12）後端，介面與 OFModel 相容。
+
+    - 以 enforce_f32=True 執行：與 tflite CPU 的 logits 差約 1e-4。
+    - 少數 op（GATHER/PAD）在 CPU 執行，其餘 2715 個 op 在 GPU。
+    - 構造時先跑一顆零窗暖機（觸發著色器編譯並驗證可執行）。
+    - 需要 dxil.dll / dxcompiler.dll（見 ensure_webgpu_runtime_dlls）。
+    """
+
+    backend = "webgpu"
+
+    def __init__(self, model_path, num_threads=None):
+        self.model_path = os.path.abspath(model_path)
+        self.num_threads = None  # GPU 推理不使用 CPU 執行緒數
+
+        err = ensure_webgpu_runtime_dlls()
+        if err:
+            print(f"  [WARN] WebGPU DLL 準備失敗：{err}")
+
+        try:
+            with _suppress_stderr_fd():
+                from ai_edge_litert.compiled_model import CompiledModel
+                from ai_edge_litert.hardware_accelerator import HardwareAccelerator
+                from ai_edge_litert import options as _options
+
+                opt = _options.Options(
+                    hardware_accelerators=(
+                        HardwareAccelerator.GPU
+                        | HardwareAccelerator.CPU
+                    )
+                )
+                try:
+                    opt.gpu_options.enforce_f32 = True
+                except Exception:
+                    pass
+
+                self.cm = CompiledModel.from_file(self.model_path, options=opt)
+                sigs = self.cm.get_signature_list()
+                self.sig = list(sigs)[0]
+                info = sigs[self.sig]
+                self.in_name = info["inputs"][0]
+                self.out_names = [
+                    n
+                    for n in (
+                        "frame_logits",
+                        "onset_logits",
+                        "offset_logits",
+                        "velocity_values",
+                    )
+                    if n in info["outputs"]
+                ]
+                if len(self.out_names) != 4:
+                    raise RuntimeError(
+                        f"模型輸出缺少 O&F logits：{info['outputs']}"
+                    )
+                in_details = self.cm.get_input_tensor_details(self.sig)
+                out_details = self.cm.get_output_tensor_details(self.sig)
+                self.in_buf = self.cm.create_input_buffer_by_name(
+                    self.sig, self.in_name
+                )
+                self.out_bufs = {
+                    n: self.cm.create_output_buffer_by_name(self.sig, n)
+                    for n in self.out_names
+                }
+        except RuntimeError:
+            raise
+        except Exception as e:
+            raise RuntimeError(
+                f"WebGPU 模型初始化失敗（{type(e).__name__}: {e}）。"
+                "常見原因：顯卡/驅動不支援 D3D12，或缺少 "
+                "tools/dxc/dxcompiler.dll 與 dxil.dll。"
+            )
+
+        in_shape = [int(v) for v in in_details[self.in_name]["shape"]]
+        self.input_len = int(np.prod(in_shape)) if in_shape else 0
+        out_shape = [
+            int(v) for v in out_details[self.out_names[0]]["shape"]
+        ]
+        self.output_len = int(out_shape[1]) if len(out_shape) >= 2 else 0
+        self.output_channels = int(out_shape[-1]) if out_shape else 0
+        self.window = 2048
+        if (
+            self.output_len <= 1
+            or (self.input_len - self.window) % (self.output_len - 1)
+        ):
+            raise RuntimeError(
+                f"無法從模型推導 hop："
+                f"input={self.input_len}, output={self.output_len}"
+            )
+        self.hop = (self.input_len - self.window) // (self.output_len - 1)
+        self.timestep = self.hop / MODEL_SR
+        print(f"O&F WebGPU：input {self.input_len} samples")
+        print(f"O&F WebGPU：output {self.output_len} frames")
+        print(
+            f"O&F WebGPU 時間解析度：{self.timestep * 1000:.2f} ms"
+            "（enforce_f32）"
+        )
+
+        # 暖機：第一次執行含著色器編譯（數秒），先跑一顆零窗，
+        # 讓真正的推理路徑不會被首窗拖慢；同時驗證 GPU 可執行。
+        with _suppress_stderr_fd():
+            self.infer(np.zeros(self.input_len, dtype=np.float32))
+
+    def infer(self, samples):
+        x = np.asarray(samples, dtype=np.float32)
+        if len(x) < self.input_len:
+            x = np.pad(x, (0, self.input_len - len(x)))
+        elif len(x) > self.input_len:
+            x = x[: self.input_len]
+        self.in_buf.write(x)
+        self.cm.run_by_name(
+            self.sig, {self.in_name: self.in_buf}, self.out_bufs
+        )
+        outs = []
+        for name in self.out_names:
+            flat = self.out_bufs[name].read(
+                self.output_len * self.output_channels, np.float32
+            )
+            outs.append(
+                flat.reshape(1, self.output_len, self.output_channels)
+            )
+        return np.transpose(np.concatenate(outs, axis=0), [1, 2, 0])
+
+
 class OFModel:
-    def __init__(self, model_path):
-        self.interpreter = get_interpreter(model_path)
+    def __init__(self, model_path, num_threads=None):
+        self.model_path = os.path.abspath(model_path)
+        self.num_threads = num_threads
+        self.interpreter = get_interpreter(model_path, num_threads=num_threads)
         self.interpreter.allocate_tensors()
         self.inputs = self.interpreter.get_input_details()
         self.outputs = self.interpreter.get_output_details()
@@ -141,7 +345,29 @@ class OFModel:
             return self.interpreter.get_tensor(self.output_by_name[name])
         return np.transpose(np.concatenate([get("frame_logits"), get("onset_logits"), get("offset_logits"), get("velocity_values")], axis=0), [1,2,0])
 
-def infer_audio(model, samples, overlap_timesteps=4):
+def _resolve_jobs(jobs=None):
+    """jobs<=0（auto）：CPU 核心數/2，上限 4。單核機器回 1。"""
+    try:
+        jobs = int(jobs or 0)
+    except (TypeError, ValueError):
+        jobs = 0
+    if jobs > 0:
+        return jobs
+    try:
+        cpu = int(os.cpu_count() or 2)
+    except Exception:
+        cpu = 2
+    return max(1, min(4, cpu // 2))
+
+
+def infer_audio(model, samples, overlap_timesteps=4, jobs=1, models=None, verbose=True):
+    """O&F 全曲推理。jobs>1 時用多顆獨立 interpreter 平行跑 windows。
+
+    每顆 interpreter 有自己的 session（TFLite session 非執行緒安全，
+    不可共用）。models 可傳入預建的 OFModel list；沒傳則按需建立。
+    輸出順序與序列版完全一致（按全域 window 編號保序拼接）。
+    verbose=False 時不印 windows/chunk 進度（供背景執行緒使用）。
+    """
     overlap = model.hop * overlap_timesteps + model.window
     stride = max(1, model.input_len - overlap)
     x = np.pad(samples, (0, max(0, model.input_len-len(samples))))
@@ -149,16 +375,65 @@ def infer_audio(model, samples, overlap_timesteps=4):
     last = max(0, len(x)-model.input_len)
     if not starts or starts[-1] != last: starts.append(last)
     results, times = [], []
-    print(f"Onsets & Frames 推理：{len(starts)} 個 windows")
-    for n,start in enumerate(starts,1):
-        pred = model.infer(x[start:start+model.input_len])
-        cut = overlap_timesteps if n > 1 else 0
-        pred = pred[cut:]
-        local_start = start + cut*model.hop
-        results.append(pred)
-        times.append(local_start/MODEL_SR + np.arange(len(pred))*model.timestep)
-        print(f"\r  window {n}/{len(starts)}", end="", flush=True)
-    print()
+    if verbose:
+        print(f"Onsets & Frames 推理：{len(starts)} 個 windows")
+    jobs = max(1, int(jobs or 1))
+
+    if jobs <= 1 or len(starts) <= 1:
+        for n,start in enumerate(starts,1):
+            pred = model.infer(x[start:start+model.input_len])
+            cut = overlap_timesteps if n > 1 else 0
+            pred = pred[cut:]
+            local_start = start + cut*model.hop
+            results.append(pred)
+            times.append(local_start/MODEL_SR + np.arange(len(pred))*model.timestep)
+            if verbose:
+                print(f"\r  window {n}/{len(starts)}", end="", flush=True)
+        if verbose:
+            print()
+        return np.concatenate(results), np.concatenate(times)
+
+    # ---- 平行路徑 ----
+    import concurrent.futures as _cf
+    workers = list(models) if models else [model]
+    while len(workers) < jobs:
+        workers.append(
+            OFModel(model.model_path, num_threads=getattr(model, "num_threads", None))
+        )
+    workers = workers[:jobs]
+
+    indexed = list(enumerate(starts, 1))  # (全域編號n, start)
+    chunk_size = max(1, (len(indexed) + jobs - 1) // jobs)
+    chunks = [indexed[i:i + chunk_size] for i in range(0, len(indexed), chunk_size)]
+
+    def _run(chunk, worker):
+        out = []
+        for n, start in chunk:
+            pred = worker.infer(x[start:start + worker.input_len])
+            cut = overlap_timesteps if n > 1 else 0
+            pred = pred[cut:]
+            local_start = start + cut * worker.hop
+            out.append((
+                pred,
+                local_start / MODEL_SR + np.arange(len(pred)) * worker.timestep,
+            ))
+        return out
+
+    with _cf.ThreadPoolExecutor(max_workers=len(chunks)) as ex:
+        futs = [
+            ex.submit(_run, ch, workers[i % len(workers)])
+            for i, ch in enumerate(chunks)
+        ]
+        done = 0
+        for f in futs:  # 按 chunk 順序取回，保序拼接
+            for pred, tt in f.result():
+                results.append(pred)
+                times.append(tt)
+            done += 1
+            if verbose:
+                print(f"\r  chunk {done}/{len(chunks)}", end="", flush=True)
+    if verbose:
+        print()
     return np.concatenate(results), np.concatenate(times)
 
 def predictions_to_notes(pred, times, onset_threshold=.45, frame_threshold=.40, min_duration=.035, max_duration=12.0):
@@ -335,7 +610,7 @@ def build_nbs_bytes(notes, tps=20.0, song_name="Onsets & Frames",
 def main():
     ap=argparse.ArgumentParser(description='Onsets & Frames TFLite → NBS')
     ap.add_argument('input'); ap.add_argument('-o','--output',required=True); ap.add_argument('--model',default=None); ap.add_argument('--ffmpeg',default=None)
-    ap.add_argument('--tempo',type=int,default=20); ap.add_argument('--onset-threshold',type=float,default=.45); ap.add_argument('--frame-threshold',type=float,default=.40); ap.add_argument('--min-duration',type=float,default=.035); ap.add_argument('--keep-wav',action='store_true')
+    ap.add_argument('--tempo',type=int,default=20); ap.add_argument('--onset-threshold',type=float,default=.45); ap.add_argument('--frame-threshold',type=float,default=.40); ap.add_argument('--min-duration',type=float,default=.035); ap.add_argument('--keep-wav',action='store_true'); ap.add_argument('--jobs',type=int,default=0,help='O&F 推理平行度（獨立 interpreter 數）；0=自動（CPU核心/2，上限4），1=序列')
     args=ap.parse_args()
     if not os.path.isfile(args.input): print(f'[ERROR] 找不到輸入：{args.input}'); return 2
     base=os.path.dirname(os.path.abspath(__file__)); model_path=args.model or os.path.join(base,'models','onsets_frames_uni.tflite')
@@ -344,7 +619,7 @@ def main():
         model=OFModel(model_path)
         with tempfile.TemporaryDirectory(prefix='of_nbs_') as td:
             wav=os.path.join(td,'input.wav'); print('[1/4] FFmpeg → 16 kHz mono WAV ...'); convert_to_wav(args.input,wav,args.ffmpeg); samples=load_wav(wav); print(f'音訊長度：{len(samples)/MODEL_SR:.2f} 秒')
-            print('[2/4] Onsets & Frames neural inference ...'); pred,times=infer_audio(model,samples)
+            print('[2/4] Onsets & Frames neural inference ...'); jobs=_resolve_jobs(args.jobs); print(f'推理平行度：{jobs}'); pred,times=infer_audio(model,samples,jobs=jobs)
             print('[3/4] onset/frame → piano notes ...'); notes=predictions_to_notes(pred,times,args.onset_threshold,args.frame_threshold,args.min_duration); print(f'偵測到 {len(notes)} 個音符')
             if not notes: raise RuntimeError('模型沒有偵測到音符；可嘗試降低 --onset-threshold')
             qnotes = quantize_notes(notes, args.tempo)

@@ -59,6 +59,14 @@ except Exception:
 _RMVPE_MODEL_CACHE = {}
 _OF_MODEL_CACHE = {}
 
+# O&F WebGPU 引擎（auto）探測結果：只嘗試一次，失敗就記住並全面
+# 退回 tflite CPU，避免 Piano/Guitar/Other 三次都重試。
+_WEBGPU_ENGINE_STATE = {
+    "tried": False,
+    "ok": False,
+    "error": None,
+}
+
 
 # ============================================================
 # 持久化快取
@@ -92,6 +100,93 @@ def _ensure_cache_dir(name):
     path = os.path.join(_CACHE_ROOT, name)
     os.makedirs(path, exist_ok=True)
     return path
+
+
+def _torch_cuda_available():
+    """torch + CUDA 是否可用（只做偵測，不 import 大型子模組）。"""
+    try:
+        import torch
+        return bool(torch.cuda.is_available())
+    except Exception:
+        return False
+
+
+def _resolve_demucs_device(device):
+    """device=None（auto）時：有 CUDA 用 cuda，否則用 cpu。"""
+    if device:
+        return device
+    return "cuda" if _torch_cuda_available() else "cpu"
+
+
+def _resolve_rmvpe_device(device):
+    """device=None（auto）時：有 CUDA 先試 cuda。
+
+    cuda provider 缺失（只裝 CPU 版 onnxruntime）會在建模時拋錯，
+    由 _get_rmvpe_model 捕捉並退回 CPU。
+    """
+    if device:
+        return device
+    return "cuda" if _torch_cuda_available() else None
+
+
+def _looks_like_oom(exc):
+    """判斷例外是否疑似 VRAM/記憶體不足，值得縮小 segment 重試。"""
+    name = type(exc).__name__
+    if name in ("OutOfMemoryError", "OutOfMemoryCudaError"):
+        return True
+    try:
+        msg = str(exc).lower()
+    except Exception:
+        return False
+    return (
+        "out of memory" in msg
+        or "cuda" in msg and "memory" in msg
+        or "cudnn" in msg
+        or "cublas" in msg
+    )
+
+
+def _save_notes_npz(path, notes):
+    """把 (start, end, pitch[, velocity]) list 存成 npz。"""
+    if notes:
+        has_vel = all(len(n) >= 4 for n in notes)
+    else:
+        has_vel = False
+    np.savez_compressed(
+        path,
+        start=np.asarray([n[0] for n in notes], dtype=np.float64),
+        end=np.asarray([n[1] for n in notes], dtype=np.float64),
+        pitch=np.asarray([n[2] for n in notes], dtype=np.int16),
+        velocity=(
+            np.asarray([n[3] for n in notes], dtype=np.int16)
+            if has_vel
+            else np.zeros(0, dtype=np.int16)
+        ),
+    )
+
+
+def _load_notes_npz(path):
+    """讀取 _save_notes_npz 存的檔，回傳 (notes, has_velocity)。"""
+    cached = np.load(path, allow_pickle=False)
+    try:
+        starts = [float(x) for x in cached["start"]]
+        ends = [float(x) for x in cached["end"]]
+        pitches = [int(x) for x in cached["pitch"]]
+        vel = np.asarray(cached["velocity"]) if "velocity" in cached else np.zeros(0)
+        if len(vel) == len(starts) and len(starts) > 0:
+            return (
+                [
+                    (s, e, p, int(v))
+                    for s, e, p, v in zip(starts, ends, pitches, vel)
+                ],
+                True,
+            )
+        return (
+            [(s, e, p) for s, e, p in zip(starts, ends, pitches)],
+            False,
+        )
+    finally:
+        cached.close()
 
 
 # ============================================================
@@ -176,45 +271,14 @@ def progress_step(
 # Demucs 4-Stem
 # ============================================================
 
-def separate_4stems(
+def _separate_4stems_subprocess(
     mp3_path: str,
     work_dir: str,
-    model: str = "htdemucs",
-    device: str | None = None,
-    segment: int | None = None,
+    model: str,
+    device: str,
+    segment: int | None,
 ):
-    base = os.path.splitext(os.path.basename(mp3_path))[0]
-    cache_key = _cache_key_for_file(
-        mp3_path,
-        "demucs-v1",
-        model,
-        device or "auto",
-        segment,
-    )
-    cache_root = _ensure_cache_dir("demucs")
-    cache_work_dir = os.path.join(cache_root, cache_key)
-    cache_out_dir = os.path.join(cache_work_dir, model, base)
-    expected = {
-        name: os.path.join(cache_out_dir, f"{name}.wav")
-        for name in ("vocals", "drums", "bass", "other")
-    }
-
-    if all(os.path.isfile(path) for path in expected.values()):
-        print(
-            f"Demucs 4-Stem 快取命中 (model={model})"
-        )
-        return expected
-
-    print(
-        f"Demucs 4-Stem 分離 "
-        f"(model={model}) ..."
-    )
-
-    # Demucs 直接輸出到持久化 cache；這樣 TemporaryDirectory 不會讓
-    # 下一次執行又把 4 個 stem 全部重新算一次。
-    work_dir = cache_work_dir
-    os.makedirs(work_dir, exist_ok=True)
-
+    """舊路徑：subprocess 跑 `python -m demucs`（in-process 失敗時的 fallback）。"""
     cmd = [
         sys.executable,
         "-m",
@@ -223,13 +287,9 @@ def separate_4stems(
         model,
         "-o",
         work_dir,
+        "-d",
+        device,
     ]
-
-    if device:
-        cmd += [
-            "-d",
-            device,
-        ]
 
     if segment:
         cmd += [
@@ -244,29 +304,202 @@ def separate_4stems(
         check=True,
     )
 
+
+def _separate_4stems_inprocess(
+    mp3_path: str,
+    out_dir: str,
+    model: str,
+    device: str,
+    segment: int | None,
+):
+    """新路徑：in-process `demucs.api.Separator`。
+
+    省掉 subprocess 每次重付的 torch import（Windows 約 10~30 秒）+
+    模型載入，並與後續 RMVPE 共用同一個 CUDA context。
+    輸出寫成與 demucs CLI 相同的版式：
+    out_dir/{vocals,drums,bass,other}.wav（44.1 kHz 立體聲）。
+    """
+    import torch
+    from demucs.api import Separator
+
+    os.makedirs(out_dir, exist_ok=True)
+
+    print(
+        f"  Demucs in-process 分離 "
+        f"(model={model}, device={device}, segment={segment}) ..."
+    )
+    sep = Separator(
+        model=model,
+        device=device,
+        segment=segment,
+        progress=False,
+    )
+    try:
+        try:
+            out_sr = int(
+                getattr(sep, "samplerate", getattr(sep, "_samplerate", 44100))
+            )
+        except Exception:
+            out_sr = 44100
+        _orig_wav, separated = sep.separate_audio_file(mp3_path)
+    finally:
+        # 模型權重佔 VRAM，先釋放，後面的 RMVPE/O&F 才有乾淨的 VRAM。
+        try:
+            del sep
+        except Exception:
+            pass
+        try:
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:
+            pass
+
+    import soundfile as sf
+
+    for name, wav in separated.items():
+        try:
+            arr = wav.detach().cpu().to(torch.float32).numpy()
+        except Exception:
+            arr = np.asarray(wav, dtype=np.float32)
+        if arr.ndim == 1:
+            arr = arr[None, :]
+        # (channels, samples) → (samples, channels)
+        sf.write(
+            os.path.join(out_dir, f"{name}.wav"),
+            np.ascontiguousarray(arr.T),
+            out_sr,
+        )
+
+
+def separate_4stems(
+    mp3_path: str,
+    work_dir: str,
+    model: str = "htdemucs",
+    device: str | None = None,
+    segment: int | None = None,
+    inprocess: bool = True,
+    stem_names=("vocals", "drums", "bass", "other"),
+):
+    base = os.path.splitext(os.path.basename(mp3_path))[0]
+    cache_key = _cache_key_for_file(
+        mp3_path,
+        "demucs-v1",
+        model,
+        device or "auto",
+        segment,
+    )
+    cache_root = _ensure_cache_dir("demucs")
+    cache_work_dir = os.path.join(cache_root, cache_key)
+    cache_out_dir = os.path.join(cache_work_dir, model, base)
+    expected = {
+        name: os.path.join(cache_out_dir, f"{name}.wav")
+        for name in stem_names
+    }
+
+    if all(os.path.isfile(path) for path in expected.values()):
+        print(
+            f"Demucs 快取命中 (model={model}, {len(stem_names)} stems)"
+        )
+        return expected
+
+    # device=None（auto）：有 CUDA 用 cuda，否則 cpu。
+    # Demucs CLI 本來也會自動選，但這裡先解析出來，
+    # in-process 路徑與 OOM 重試判斷都需要明確的 device。
+    eff_device = _resolve_demucs_device(device)
+
+    print(
+        f"Demucs 分離 "
+        f"(model={model}, device={eff_device}, "
+        f"{len(stem_names)} stems) ..."
+    )
+
+    # Demucs 直接輸出到持久化 cache；這樣 TemporaryDirectory 不會讓
+    # 下一次執行又把 4 個 stem 全部重新算一次。
+    work_dir = cache_work_dir
+    os.makedirs(work_dir, exist_ok=True)
+
     out_dir = os.path.join(
         work_dir,
         model,
         base,
     )
 
+    # OOM 重試鏈：先用完整長度跑；疑似 VRAM 不足時逐步縮小 segment。
+    # 手動指定 --segment 時尊重使用者設定，不再重試。
+    if segment:
+        segment_attempts = [int(segment)]
+    else:
+        segment_attempts = [None, 20, 10, 5]
+
+    for attempt, seg in enumerate(segment_attempts):
+        try:
+            if attempt > 0:
+                print(
+                    f"  Demucs 重試 ({attempt + 1}/{len(segment_attempts)})："
+                    f"segment={seg} ..."
+                )
+            if inprocess:
+                try:
+                    _separate_4stems_inprocess(
+                        mp3_path,
+                        out_dir,
+                        model=model,
+                        device=eff_device,
+                        segment=seg,
+                    )
+                except Exception as exc:
+                    # in-process 缺依賴/初始化失敗時退回 subprocess，
+                    # 只有第一次嘗試才退回（避免無限互跳）。
+                    if attempt == 0 and not _looks_like_oom(exc):
+                        print(
+                            f"  [WARN] Demucs in-process 失敗"
+                            f"（{type(exc).__name__}: {exc}），"
+                            f"改用 subprocess ..."
+                        )
+                        _separate_4stems_subprocess(
+                            mp3_path,
+                            work_dir,
+                            model=model,
+                            device=eff_device,
+                            segment=seg,
+                        )
+                    else:
+                        raise
+            else:
+                _separate_4stems_subprocess(
+                    mp3_path,
+                    work_dir,
+                    model=model,
+                    device=eff_device,
+                    segment=seg,
+                )
+            break
+        except Exception as exc:
+            # subprocess 的 CalledProcessError 看不到 stderr，
+            # 在 CUDA 下失敗一律視為值得縮小重試（Demucs 最常見死因就是 OOM）。
+            sheltered = _looks_like_oom(exc) or (
+                isinstance(exc, subprocess.CalledProcessError)
+                and str(eff_device).startswith("cuda")
+            )
+            if not sheltered or attempt + 1 >= len(segment_attempts):
+                raise
+            print(
+                f"  [WARN] Demucs 疑似 VRAM 不足"
+                f"（{type(exc).__name__}），縮小 segment 重試 ..."
+            )
+            try:
+                import torch
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            except Exception:
+                pass
+
     stems = {
-        "vocals": os.path.join(
+        name: os.path.join(
             out_dir,
-            "vocals.wav",
-        ),
-        "drums": os.path.join(
-            out_dir,
-            "drums.wav",
-        ),
-        "bass": os.path.join(
-            out_dir,
-            "bass.wav",
-        ),
-        "other": os.path.join(
-            out_dir,
-            "other.wav",
-        ),
+            f"{name}.wav",
+        )
+        for name in stem_names
     }
 
     for name, path in stems.items():
@@ -279,7 +512,7 @@ def separate_4stems(
             )
 
     print(
-        "Demucs 4-Stem 完成"
+        f"Demucs {len(stem_names)}-Stem 完成"
     )
 
     return stems
@@ -289,22 +522,52 @@ def separate_4stems(
 # RMVPE 單音旋律
 # ============================================================
 
+_RMVPE_HALF_WARNED = False
+
+
 def _get_rmvpe_model(device=None, model_path=None, is_half=False):
+    global _RMVPE_HALF_WARNED
     if RMVPE is None:
         raise RuntimeError(
             "找不到 RMVPE ONNX。請先執行：python -m pip install rmvpe-onnx；"
             f"原始錯誤：{_RMVPE_IMPORT_ERROR}"
         )
 
+    if is_half and not _RMVPE_HALF_WARNED:
+        _RMVPE_HALF_WARNED = True
+        print(
+            "[WARN] --melody-rmvpe-half：上游 rmvpe-onnx 不支援 FP16，"
+            "此旗標目前無作用（已忽略）。"
+        )
+
     # rmvpe-onnx 使用 ONNX Runtime provider，不使用舊 PyTorch RMVPE API。
-    # 預設先使用套件自己的 provider 選擇；模型會在第一次 predict 時自動下載。
-    cache_key = (model_path or "__default__", bool(is_half))
+    # device 會實際傳進 RMVPE()；cuda provider 缺失時退回 CPU。
+    # 模型會在第一次建模時自動下載。
+    resolved = _resolve_rmvpe_device(device)
+    cache_key = (model_path or "__default__", resolved or "__auto__", bool(is_half))
     if cache_key not in _RMVPE_MODEL_CACHE:
-        print("  RMVPE → 載入 ONNX 模型 ...")
+        print(f"  RMVPE → 載入 ONNX 模型 (device={resolved}) ...")
         kwargs = {}
         if model_path:
             kwargs["model_path"] = model_path
-        _RMVPE_MODEL_CACHE[cache_key] = RMVPE(**kwargs)
+        try:
+            if resolved is None:
+                _RMVPE_MODEL_CACHE[cache_key] = RMVPE(**kwargs)
+            else:
+                _RMVPE_MODEL_CACHE[cache_key] = RMVPE(device=resolved, **kwargs)
+        except Exception as exc:
+            # 常見原因：要求 cuda/dml 但只裝了 CPU 版 onnxruntime
+            # （需 pip install onnxruntime-gpu 才有 CUDA）。
+            print(
+                f"  [WARN] RMVPE device={resolved!r} 初始化失敗"
+                f"（{type(exc).__name__}: {exc}），退回 CPU。"
+            )
+            _RMVPE_MODEL_CACHE[cache_key] = RMVPE(device="cpu", **kwargs)
+        try:
+            providers = _RMVPE_MODEL_CACHE[cache_key].session.get_providers()
+            print(f"  RMVPE → 生效 provider：{providers}")
+        except Exception:
+            pass
         print("  RMVPE → ONNX 模型載入完成")
     return _RMVPE_MODEL_CACHE[cache_key]
 
@@ -314,6 +577,9 @@ def _absorb_short_notes(
     min_len,
     merge_gap=0.05,
     ratio_guard=1.5,
+    protect=None,
+    trace=None,
+    max_gap=None,
 ):
     """把滑音/過渡產生的碎片音符吸附進鄰近長音。
 
@@ -331,29 +597,82 @@ def _absorb_short_notes(
     - 優先併入同音高的鄰居，其次併入較長的一側；
     - 沒有合格鄰音的候選保留原狀（Rap / 裝飾音群）。
 
+    `protect`：與 raw_notes 對齊的布林序列。True 的音符即使很短
+    也不會被當成候選吸收掉（但仍可以被其他碎片併入）——用來標記
+    「起點對齊能量 onset」的音符：真正的滑音過渡不會剛好從一個
+    新的能量起振點開始，但 Rap 字頭會，這樣可以避免快速念詞的
+    整串音節被誤判成滑音吃掉。
+
     回傳合併後的 (start, end, pitch) list。
     """
+    tr = None
+    if trace is not None:
+        tr = {
+            "min_len": float(min_len),
+            "merge_gap": float(merge_gap),
+            "ratio_guard": float(ratio_guard),
+            "max_gap": None if max_gap is None else float(max_gap),
+            "input_count": len(raw_notes),
+            "initial_notes": [
+                (float(s), float(e), int(p), bool(prot))
+                for (s, e, p), prot in zip(
+                    raw_notes,
+                    protect if protect is not None else [False] * len(raw_notes),
+                )
+            ],
+            "protect_count": (
+                int(sum(bool(x) for x in protect))
+                if protect is not None
+                else 0
+            ),
+            "events": [],
+            "blocked": [],
+        }
+        trace["absorb"] = tr
+
     if not raw_notes or min_len <= 0:
+        if tr is not None:
+            tr["absorbed_count"] = 0
+            tr["absorbed_notes"] = list(raw_notes)
+            tr["final_count"] = len(raw_notes)
+            tr["final_notes"] = list(raw_notes)
         return list(raw_notes)
 
-    notes = [[float(s), float(e), int(p)] for s, e, p in raw_notes]
+    if protect is None:
+        protect = [False] * len(raw_notes)
+
+    notes = [
+        [float(s), float(e), int(p), bool(prot)]
+        for (s, e, p), prot in zip(raw_notes, protect)
+    ]
     glide_max = float(min_len) * 2.0
     blocked = set()
 
     def _candidate(i):
         """判定 notes[i] 是否為可吸附的滑音/碎片候選。"""
-        s, e, p = notes[i]
+        s, e, p, prot = notes[i]
         d = e - s
+        has_nb = 0 < i and i + 1 < len(notes)
+        glide_shape = False
+        if has_nb:
+            prev_p = notes[i - 1][2]
+            next_p = notes[i + 1][2]
+            lo, hi = (prev_p, next_p) if prev_p < next_p else (next_p, prev_p)
+            glide_shape = (
+                lo < p < hi
+                and abs(p - prev_p) <= 3
+                and abs(next_p - p) <= 3
+            )
+        # onset 保護只給「不是單調階梯形」的音符：滑音過渡本來就
+        # 是 pitch 嚴格夾在前後兩音之間，即使碰巧有能量起伏 onset
+        # 也不該保護；Rap 字頭通常是跳動而不是單調滑行。
+        if prot and not glide_shape:
+            return False
         if d < min_len:
             return True
-        if d >= glide_max or i == 0 or i + 1 >= len(notes):
+        if d >= glide_max or not has_nb:
             return False
-        prev_p = notes[i - 1][2]
-        next_p = notes[i + 1][2]
-        lo, hi = (prev_p, next_p) if prev_p < next_p else (next_p, prev_p)
-        if not (lo < p < hi):
-            return False
-        return abs(p - prev_p) <= 3 and abs(next_p - p) <= 3
+        return glide_shape
 
     while True:
         best_i = -1
@@ -370,37 +689,116 @@ def _absorb_short_notes(
         if best_i < 0:
             break
 
-        s, e, p = notes[best_i]
+        s, e, p, _prot = notes[best_i]
         prev_n = notes[best_i - 1] if best_i > 0 else None
         next_n = notes[best_i + 1] if best_i + 1 < len(notes) else None
+        prev_gap = None if prev_n is None else s - prev_n[1]
+        next_gap = None if next_n is None else next_n[0] - e
+
+        def _gap_ok(gap):
+            if max_gap is None:
+                return True
+            return gap is not None and gap <= max_gap
 
         cands = []
-        if prev_n is not None and (prev_n[1] - prev_n[0]) >= best_d * ratio_guard:
+        if (
+            prev_n is not None
+            and _gap_ok(prev_gap)
+            and (prev_n[1] - prev_n[0]) >= best_d * ratio_guard
+        ):
             cands.append(prev_n)
-        if next_n is not None and (next_n[1] - next_n[0]) >= best_d * ratio_guard:
+        if (
+            next_n is not None
+            and _gap_ok(next_gap)
+            and (next_n[1] - next_n[0]) >= best_d * ratio_guard
+        ):
             cands.append(next_n)
+
+        if tr is not None:
+            prev_p = prev_n[2] if prev_n is not None else None
+            next_p = next_n[2] if next_n is not None else None
+            glide_shape = False
+            if prev_p is not None and next_p is not None:
+                lo, hi = (
+                    (prev_p, next_p)
+                    if prev_p < next_p
+                    else (next_p, prev_p)
+                )
+                glide_shape = (
+                    lo < p < hi
+                    and abs(p - prev_p) <= 3
+                    and abs(next_p - p) <= 3
+                )
+            tr["events"].append(
+                {
+                    "kind": "glide" if best_d >= min_len else "short",
+                    "start": float(s),
+                    "end": float(e),
+                    "dur": float(best_d),
+                    "pitch": int(p),
+                    "protected": bool(_prot),
+                    "glide_shape": bool(glide_shape),
+                    "prev_pitch": prev_p,
+                    "next_pitch": next_p,
+                    "prev_gap": prev_gap,
+                    "next_gap": next_gap,
+                    "prev_dur": (
+                        float(prev_n[1] - prev_n[0])
+                        if prev_n is not None
+                        else None
+                    ),
+                    "next_dur": (
+                        float(next_n[1] - next_n[0])
+                        if next_n is not None
+                        else None
+                    ),
+                    "result": "blocked" if not cands else None,
+                }
+            )
 
         if not cands:
             # 快速樂段：兩側都不夠長 → 保留這個碎片，不再重試。
             blocked.add(id(notes[best_i]))
+            if tr is not None:
+                tr["blocked"].append(
+                    (float(s), float(e), int(p), float(best_d))
+                )
             continue
 
         def _absorb_key(nb, _p=p):
             return (0 if nb[2] == _p else 1, -(nb[1] - nb[0]))
 
         target = min(cands, key=_absorb_key)
+        if tr is not None:
+            tr["events"][-1]["result"] = (
+                "absorb_prev" if target is prev_n else "absorb_next"
+            )
+            tr["events"][-1]["target_pitch"] = int(target[2])
+            tr["events"][-1]["target_dur"] = float(
+                target[1] - target[0]
+            )
         if target is prev_n:
             target[1] = e      # 前音延伸，蓋掉過渡碎片
         else:
             target[0] = s      # 後音提前開始
         del notes[best_i]
 
+    if tr is not None:
+        tr["absorbed_count"] = len(notes)
+        tr["absorbed_notes"] = [
+            (float(s), float(e), int(p), bool(prot))
+            for s, e, p, prot in notes
+        ]
+
     merged = []
-    for s, e, p in notes:
+    for s, e, p, _prot in notes:
         if merged and p == merged[-1][2] and s - merged[-1][1] <= merge_gap:
             merged[-1] = (merged[-1][0], e, p)
         else:
             merged.append((s, e, p))
+    if tr is not None:
+        tr["final_count"] = len(merged)
+        tr["final_notes"] = list(merged)
     return merged
 
 
@@ -417,11 +815,13 @@ def extract_melody_notes_rmvpe(
     medfilt_kernel_size=5,
     min_note_dur=0.070,
     rap_revise=True,
+    absorb_max_gap=None,
     name="主唱",
     device=None,
     model_path=None,
     is_half=False,
     verbose_progress=True,
+    trace=None,
 ):
     """RMVPE → F0 → note segmentation。
 
@@ -435,7 +835,42 @@ def extract_melody_notes_rmvpe(
     import librosa
     from scipy.ndimage import median_filter
 
+    tr = None
+    if trace is not None:
+        tr = {
+            "params": {
+                "fmin_note": fmin_note,
+                "fmax_note": fmax_note,
+                "min_dur": float(min_dur),
+                "gap_tolerance": float(gap_tolerance),
+                "voiced_prob_thresh": float(voiced_prob_thresh),
+                "octave_shift": int(octave_shift),
+                "pitch_persistence_sec": float(pitch_persistence_sec),
+                "medfilt_kernel_size": int(medfilt_kernel_size),
+                "min_note_dur": float(min_note_dur),
+                "rap_revise": bool(rap_revise),
+                "absorb_max_gap": (
+                    None
+                    if absorb_max_gap is None
+                    else float(absorb_max_gap)
+                ),
+            },
+            "dropped_min_dur": [],
+            "dropped_merge": [],
+        }
+        trace["melody"] = tr
+
     if y is None or len(y) == 0:
+        if tr is not None:
+            tr.update(
+                n_frames=0,
+                hop_sec=None,
+                voiced_frames=0,
+                notes_segmented=0,
+                notes_merged=0,
+                protect_count=0,
+                notes_final=[],
+            )
         return []
 
     print(f"{name} RMVPE 音高追蹤 ...")
@@ -479,13 +914,68 @@ def extract_melody_notes_rmvpe(
     else:
         hop_sec = 0.01
 
-    f0[confidence < float(voiced_prob_thresh)] = 0.0
+    if tr is not None:
+        tr["n_frames"] = int(len(times))
+        tr["hop_sec"] = float(hop_sec)
+
+    # --------------------------------------------------------
+    # 信心度門檻 + 長段落搶救
+    # --------------------------------------------------------
+    # 固定門檻對氣音、和聲、齒音、遠場錄音等情況常常整段偏低，
+    # 結果一句歌詞被整段吃掉（觀察到有音樂段落連續 10 秒以上
+    # 完全沒有音符，但 Drums / Other 都還在正常進行，代表歌曲
+    # 本身沒有停）。這裡只鎖定「連續夠長」的低信心區間，用較
+    # 寬鬆的門檻重新檢查該區間本身；短暫的真實停頓（換氣、
+    # 逗號）長度遠小於 rescue_min_gap_sec，不會被影響。
+    rescue_min_gap_sec = 1.2
+    rescue_thresh_ratio = 0.4
+
+    invalid_mask = confidence < float(voiced_prob_thresh)
+    min_gap_frames = max(1, int(round(rescue_min_gap_sec / hop_sec)))
+    rescued_frames = 0
+
+    if invalid_mask.any():
+        rescue_thresh = float(voiced_prob_thresh) * rescue_thresh_ratio
+        run_start = None
+        n_frames = len(invalid_mask)
+
+        for i in range(n_frames + 1):
+            still_invalid = i < n_frames and invalid_mask[i]
+            if still_invalid and run_start is None:
+                run_start = i
+            elif not still_invalid and run_start is not None:
+                run_len = i - run_start
+                if run_len >= min_gap_frames:
+                    seg = slice(run_start, i)
+                    rescue_ok = confidence[seg] >= rescue_thresh
+                    invalid_mask[seg] = ~rescue_ok
+                    rescued_frames += int(rescue_ok.sum())
+                run_start = None
+
+        if rescued_frames:
+            print(
+                f"{name} RMVPE 搶救：{rescued_frames} 個低信心 frame "
+                f"（門檻 {voiced_prob_thresh:.3f} → {rescue_thresh:.3f}）"
+            )
+
+    f0 = f0.copy()
+    f0[invalid_mask] = 0.0
     valid = np.isfinite(f0) & (f0 > 0.0)
 
     # 額外限制音域，避免 RMVPE 偶爾在無聲/子音位置產生極端 F0。
     fmin = float(librosa.note_to_hz(fmin_note))
     fmax = float(librosa.note_to_hz(fmax_note))
     valid &= (f0 >= fmin) & (f0 <= fmax)
+
+    if tr is not None:
+        tr["rescued_frames"] = int(rescued_frames)
+        tr["confidence_invalid_frames"] = int(
+            np.count_nonzero(confidence < float(voiced_prob_thresh))
+        )
+        tr["invalid_frames"] = int(np.count_nonzero(invalid_mask))
+        tr["voiced_frames"] = int(np.count_nonzero(valid))
+        tr["fmin_hz"] = float(fmin)
+        tr["fmax_hz"] = float(fmax)
 
     midi = np.full(len(f0), np.nan, dtype=np.float64)
     midi[valid] = librosa.hz_to_midi(f0[valid])
@@ -546,6 +1036,10 @@ def extract_melody_notes_rmvpe(
                 oi += 1
             if abs(onset_times_sec[oi] - t) <= onset_window:
                 onset_boost[i] = True
+
+    if tr is not None:
+        tr["onset_count"] = int(len(onset_times_sec))
+        tr["onset_boost_frames"] = int(np.count_nonzero(onset_boost))
 
     # ------------------------------------------------------------
     # 自適應 Rap / 密集人聲 segmentation
@@ -677,6 +1171,16 @@ def extract_melody_notes_rmvpe(
                 end_t,
                 int(round(current)) + int(octave_shift) * 12,
             ))
+        elif tr is not None:
+            tr["dropped_min_dur"].append(
+                {
+                    "start": float(start),
+                    "end": end_t,
+                    "dur": float(end_t - start),
+                    "pitch": int(round(current)) + int(octave_shift) * 12,
+                    "stage": "flush",
+                }
+            )
         current = None
         start = None
 
@@ -730,6 +1234,19 @@ def extract_melody_notes_rmvpe(
                             old_end,
                             int(round(old)) + int(octave_shift) * 12,
                         ))
+                    elif tr is not None:
+                        tr["dropped_min_dur"].append(
+                            {
+                                "start": float(old_start),
+                                "end": float(old_end),
+                                "dur": float(old_end - old_start),
+                                "pitch": (
+                                    int(round(old))
+                                    + int(octave_shift) * 12
+                                ),
+                                "stage": "pitch_change",
+                            }
+                        )
 
                     new_start = change_t + min(0.010, hop_sec)
                     current, start = p, new_start
@@ -752,6 +1269,53 @@ def extract_melody_notes_rmvpe(
             merged[-1] = (merged[-1][0], e, p)
         elif e - s >= float(min_dur):
             merged.append((s, e, p))
+        elif tr is not None:
+            tr["dropped_merge"].append(
+                {
+                    "start": float(s),
+                    "end": float(e),
+                    "dur": float(e - s),
+                    "pitch": int(p),
+                }
+            )
+
+    if tr is not None:
+        tr["notes_segmented"] = int(len(notes))
+        tr["notes_merged"] = int(len(merged))
+        tr["segmented_notes"] = [
+            (float(s), float(e), int(p)) for s, e, p in notes
+        ]
+        tr["merged_notes"] = [
+            (float(s), float(e), int(p)) for s, e, p in merged
+        ]
+        tr["dropped_merge_count"] = int(len(tr["dropped_merge"]))
+
+    # 起點對齊能量 onset 的音符標記為「保護」，滑音吸附時不會被當成
+    # 過渡碎片吃掉。真正的滑音 transition 是連續 F0 滑行中間的產物，
+    # 不會剛好從一個新的能量起振點開始；但 Rap／快速念詞的字頭正好
+    # 相反，一定伴隨明確的能量 onset。這樣才不會讓一整串快速音節
+    # 因為緊鄰前一個長音而被逐一吸收掉。
+    onset_arr = (
+        np.asarray(onset_times_sec, dtype=np.float64)
+        if len(onset_times_sec)
+        else np.empty(0, dtype=np.float64)
+    )
+
+    def _near_energy_onset(note_start):
+        if onset_arr.size == 0:
+            return False
+        idx = int(np.searchsorted(onset_arr, note_start))
+        window = max(hop_sec, 0.045)
+        for j in (idx - 1, idx):
+            if 0 <= j < onset_arr.size and abs(float(onset_arr[j]) - note_start) <= window:
+                return True
+        return False
+
+    protect_flags = [_near_energy_onset(s) for s, _e, _p in merged]
+
+    if tr is not None:
+        tr["protect_flags"] = [bool(x) for x in protect_flags]
+        tr["protect_count"] = int(sum(bool(x) for x in protect_flags))
 
     # 第二層：滑音抑制核心 —— 把過渡產生的短碎片吸附進鄰近長音，
     # 讓「長音 + 2~3 個滑行碎音」還原成單一音符。
@@ -759,11 +1323,21 @@ def extract_melody_notes_rmvpe(
         merged,
         min_len=float(min_note_dur),
         merge_gap=0.05,
+        protect=protect_flags,
+        trace=trace,
+        max_gap=absorb_max_gap,
     )
+
+    if tr is not None:
+        tr["notes_final"] = [
+            (float(s), float(e), int(p)) for s, e, p in absorbed
+        ]
+        tr["notes_final_count"] = int(len(absorbed))
 
     print(
         f"{name}：RMVPE 提取 {len(merged)} 個音符，"
         f"滑音吸附後 {len(absorbed)} 個"
+        f"（{sum(protect_flags)} 個字頭 onset 音符受保護）"
     )
     return absorbed
 
@@ -1655,14 +2229,15 @@ def extract_other_notes(
 # 回傳格式對齊 extract_other_notes()：(start, end, midi_pitch, velocity)。
 # ============================================================
 
-def _get_of_model(model_path=None):
+def _get_of_model(model_path=None, engine="tflite"):
     if _of is None:
         raise RuntimeError(
             "找不到 onsets_frames_to_nbs.py，"
             "請確認它與 mp3_to_nbs.py 放在同一個資料夾。"
         )
 
-    cache_key = model_path or "__default__"
+    engine = (engine or "tflite").lower()
+    cache_key = (model_path or "__default__", engine)
     if cache_key in _OF_MODEL_CACHE:
         return _OF_MODEL_CACHE[cache_key]
 
@@ -1674,10 +2249,93 @@ def _get_of_model(model_path=None):
     if not os.path.isfile(path):
         _of.download_model(path)
 
-    print(f"  Other(neural) → 載入 Onsets & Frames 模型：{path}")
-    model = _of.OFModel(path)
+    if engine == "gpu":
+        if getattr(_of, "WebGPUOFModel", None) is None:
+            raise RuntimeError(
+                "onsets_frames_to_nbs.py 缺少 WebGPUOFModel（版本不符）"
+            )
+        print(
+            f"  Other(neural) → 載入 O&F WebGPU 模型（CompiledModel）：{path}"
+        )
+        model = _of.WebGPUOFModel(path)
+    else:
+        print(
+            f"  Other(neural) → 載入 Onsets & Frames 模型（tflite）：{path}"
+        )
+        model = _of.OFModel(path)
     _OF_MODEL_CACHE[cache_key] = model
     return model
+
+
+def _resolve_of_engine(model_path, engine):
+    """解析 O&F 引擎設定。
+
+    auto：優先建立 WebGPU（CompiledModel）模型，失敗一次即記住並
+    退回 tflite。gpu：由 _get_of_model 建立（失敗直接報錯，不退回）。
+    """
+    engine = (engine or "auto").lower()
+    if engine == "tflite":
+        return "tflite"
+    if engine == "gpu":
+        return "gpu"
+
+    state = _WEBGPU_ENGINE_STATE
+    if not state["tried"]:
+        state["tried"] = True
+        try:
+            _get_of_model(model_path, engine="gpu")
+            state["ok"] = True
+            print("  Other(neural) → WebGPU（D3D12）引擎啟用")
+        except Exception as e:
+            state["ok"] = False
+            state["error"] = f"{type(e).__name__}: {e}"
+            print(
+                f"  [WARN] WebGPU O&F 不可用（{state['error']}），"
+                "改用 tflite CPU"
+            )
+    return "gpu" if state["ok"] else "tflite"
+
+
+def _resolve_of_jobs(jobs=None):
+    """jobs<=0（auto）：CPU 核心數/2，上限 4。單核機器回 1。"""
+    try:
+        jobs = int(jobs or 0)
+    except (TypeError, ValueError):
+        jobs = 0
+    if jobs > 0:
+        return jobs
+    try:
+        cpu = int(os.cpu_count() or 2)
+    except Exception:
+        cpu = 2
+    return max(1, min(4, cpu // 2))
+
+
+def _get_of_models(model_path=None, jobs=1):
+    """O&F 多 interpreter（每顆獨立 session，可在多執行緒平行推理）。
+
+    jobs=1 時回傳 [_get_of_model(...)]，與舊行為一致。
+    """
+    jobs = max(1, int(jobs))
+    base_model = _get_of_model(model_path, engine="tflite")
+    if jobs == 1:
+        return [base_model]
+    try:
+        cpu = int(os.cpu_count() or 4)
+    except Exception:
+        cpu = 4
+    threads = max(1, min(8, cpu // jobs))
+    cache_key = (model_path or "__default__", jobs, threads)
+    if cache_key not in _OF_MODEL_CACHE:
+        print(
+            f"  Other(neural) → 建立 {jobs} 個 O&F worker "
+            f"(各 {threads} threads) ..."
+        )
+        _OF_MODEL_CACHE[cache_key] = [
+            _of.OFModel(base_model.model_path, num_threads=threads)
+            for _ in range(jobs)
+        ]
+    return _OF_MODEL_CACHE[cache_key]
 
 
 def _limit_neural_polyphony(
@@ -1926,8 +2584,17 @@ def extract_other_notes_neural(
     onset_group_window: float = 0.055,
     raw_input: bool = False,
     cache_key: str | None = None,
+    jobs: int = 0,
+    engine: str = "auto",
+    verbose: bool = True,
 ):
-    """用 Onsets & Frames 模型對 Other 軌做複音轉譜。"""
+    """用 Onsets & Frames 模型對 Other 軌做複音轉譜。
+
+    jobs：O&F 推理平行度（獨立 interpreter 數）。<=0 為 auto。
+    engine：auto / tflite / gpu（見 _resolve_of_engine）。gpu 為
+    單模型序列推理（實測單顆 GPU 吞吐最佳），jobs 自動視為 1。
+    verbose：False 時不印 windows 進度（供背景預取執行緒使用）。
+    """
 
     if _of is None:
         print(
@@ -1972,7 +2639,6 @@ def extract_other_notes_neural(
     # 模型推理本身約佔這個階段最長的時間。只快取「模型轉譜結果」，
     # 不快取最後的 post-process，這樣之後調整 max_polyphony / merge_gap
     # 仍然會重新套用新參數，不會被舊結果綁死。
-    model = _get_of_model(model_path)
     model_file = model_path or os.path.join(
         os.path.dirname(os.path.abspath(__file__)),
         "models",
@@ -2025,6 +2691,23 @@ def extract_other_notes_neural(
         )
         return result
 
+    # 只有真的需要推理時才建立模型（GPU 首次初始化含著色器編譯，
+    # 約十秒；全快取命中時可完全跳過）。
+    engine = _resolve_of_engine(model_path, engine)
+    if engine == "gpu":
+        model = _get_of_model(model_path, engine="gpu")
+        jobs = 1
+        models = [model]
+        if verbose:
+            print("  Other(neural) → 推理引擎：WebGPU（D3D12, f32）")
+    else:
+        jobs = _resolve_of_jobs(jobs)
+        model = _get_of_model(model_path, engine="tflite")
+        if jobs > 1:
+            models = _get_of_models(model_path, jobs)
+        else:
+            models = [model]
+
     y16 = y_clean
     if sr != _of.MODEL_SR:
         import librosa
@@ -2034,7 +2717,11 @@ def extract_other_notes_neural(
             target_sr=_of.MODEL_SR,
         )
 
-    pred, times = _of.infer_audio(model, y16)
+    if jobs > 1:
+        print(f"  Other(neural) → O&F 平行推理（{jobs} workers） ...")
+    pred, times = _of.infer_audio(
+        model, y16, jobs=jobs, models=models, verbose=verbose
+    )
     notes = _of.predictions_to_notes(
         pred,
         times,
@@ -2081,10 +2768,26 @@ def extract_other_notes_neural(
     return result
 
 
-def run_other_extraction(y_other, sr, args, y_harm=None, cache_key=None):
-    """依 --other-extract-backend 選擇 CQT 或神經網路來抽取 Other 音符。"""
+def run_other_extraction(
+    y_other,
+    sr,
+    args,
+    y_harm=None,
+    cache_key=None,
+    param_overrides=None,
+    verbose=True,
+):
+    """依 --other-extract-backend 選擇 CQT 或神經網路來抽取 Other 音符。
+
+    param_overrides：可針對單一 stem（如 Piano/Guitar）覆蓋部分
+    抽取參數，不影響 Other 主軌的設定。支援的 key：
+    onset_threshold / frame_threshold / min_duration / min_velocity /
+    max_polyphony。
+    verbose：False 時不印 windows 進度（背景預取用）。
+    """
 
     backend = getattr(args, "other_extract_backend", "neural")
+    ov = param_overrides or {}
 
     if backend == "neural":
         return extract_other_notes_neural(
@@ -2092,18 +2795,36 @@ def run_other_extraction(y_other, sr, args, y_harm=None, cache_key=None):
             sr,
             octave_shift=args.other_octave_shift,
             model_path=args.other_neural_model,
-            onset_threshold=args.other_neural_onset_threshold,
-            frame_threshold=args.other_neural_frame_threshold,
-            min_duration=args.other_neural_min_duration,
-            min_velocity=args.other_neural_min_velocity,
+            onset_threshold=ov.get(
+                "onset_threshold",
+                args.other_neural_onset_threshold,
+            ),
+            frame_threshold=ov.get(
+                "frame_threshold",
+                args.other_neural_frame_threshold,
+            ),
+            min_duration=ov.get(
+                "min_duration",
+                args.other_neural_min_duration,
+            ),
+            min_velocity=ov.get(
+                "min_velocity",
+                args.other_neural_min_velocity,
+            ),
             midi_min=args.other_neural_midi_min,
             midi_max=args.other_neural_midi_max,
             max_duration=args.other_neural_max_duration,
             merge_gap=args.other_neural_merge_gap,
-            max_polyphony=args.other_neural_max_polyphony,
+            max_polyphony=ov.get(
+                "max_polyphony",
+                args.other_neural_max_polyphony,
+            ),
             onset_group_window=args.other_neural_onset_group_window,
             raw_input=args.other_neural_raw,
             cache_key=cache_key,
+            jobs=getattr(args, "other_neural_jobs", 0),
+            engine=getattr(args, "other_neural_engine", "auto"),
+            verbose=verbose,
         )
 
     return extract_other_notes(
@@ -2430,15 +3151,94 @@ L_KICK = 9
 L_SNARE = 10
 L_HAT = 11
 
+# 6-stem 級聯分離（htdemucs_6s）專用層（Phase C/D）：
+# Piano / Guitar 各依音域拆 4 個 band（分界 PIANO_GUITAR_BAND_BOUNDS
+# = 48/60/72）——同一 tick 的和弦音只要落在不同音域帶就能並存，
+# 不再被 replace_weaker 擠成單音（Phase D 救和弦：實測音符保留率
+# 由 55% → 78-82%）。
+# 沒開啟級聯時不會有音符，層數維持 12，舊輸出 byte 不變。
+L_PIANO_BANDS = (12, 13, 14, 15)
+L_GUITAR_BANDS = (16, 17, 18, 19)
+PIANO_GUITAR_BAND_BOUNDS = (48, 60, 72)
 
+
+# NBS 原版 16 種樂器（v5 格式；16 以上為 custom instruments）。
+# harp 與 piano 同為 0 號（Air），hat 與 click 同為 4 號（Glass）。
 INSTR = {
     'harp': 0,
+    'piano': 0,
     'bass': 1,
     'bd': 2,
     'snare': 3,
     'hat': 4,
+    'click': 4,
     'guitar': 5,
     'flute': 6,
+    'bell': 7,
+    'chime': 8,
+    'xylophone': 9,
+    'iron_xylophone': 10,
+    'cow_bell': 11,
+    'didgeridoo': 12,
+    'bit': 13,
+    'banjo': 14,
+    'pling': 15,
+}
+
+
+# 樂器 preset。pop 為預設（華語流行：鋼琴+吉他）。
+# legacy 精確重現加入 preset 之前的音色，供回歸比對。
+INSTRUMENT_PRESETS = {
+    "legacy": {
+        "melody": "flute",
+        "bass": "bass",
+        "other_low": "guitar",
+        "other_mid": "harp",
+        "other_high": "harp",
+        "chord": "guitar",
+        "piano": "harp",
+        "guitar": "guitar",
+    },
+    "pop": {
+        "melody": "flute",
+        "bass": "bass",
+        "other_low": "guitar",
+        "other_mid": "harp",
+        "other_high": "pling",
+        "chord": "harp",
+        "piano": "harp",
+        "guitar": "guitar",
+    },
+    "rock": {
+        "melody": "flute",
+        "bass": "bass",
+        "other_low": "guitar",
+        "other_mid": "guitar",
+        "other_high": "pling",
+        "chord": "guitar",
+        "piano": "harp",
+        "guitar": "guitar",
+    },
+    "synth": {
+        "melody": "bit",
+        "bass": "bass",
+        "other_low": "iron_xylophone",
+        "other_mid": "pling",
+        "other_high": "bit",
+        "chord": "pling",
+        "piano": "pling",
+        "guitar": "banjo",
+    },
+    "orchestra": {
+        "melody": "flute",
+        "bass": "bass",
+        "other_low": "harp",
+        "other_mid": "chime",
+        "other_high": "bell",
+        "chord": "chime",
+        "piano": "harp",
+        "guitar": "guitar",
+    },
 }
 
 
@@ -2455,6 +3255,14 @@ LAYER_NAMES = {
     L_KICK: "Kick",
     L_SNARE: "Snare",
     L_HAT: "HiHat",
+    L_PIANO_BANDS[0]: "Piano Low",
+    L_PIANO_BANDS[1]: "Piano Mid-Low",
+    L_PIANO_BANDS[2]: "Piano Mid-High",
+    L_PIANO_BANDS[3]: "Piano High",
+    L_GUITAR_BANDS[0]: "Guitar Low",
+    L_GUITAR_BANDS[1]: "Guitar Mid-Low",
+    L_GUITAR_BANDS[2]: "Guitar Mid-High",
+    L_GUITAR_BANDS[3]: "Guitar High",
 }
 
 
@@ -2493,6 +3301,225 @@ def midi_to_nbs_key(
 # NBS Builder
 # ============================================================
 
+def classify_other_layer(pitch, duration):
+    p = int(pitch)
+    d = max(0.0, float(duration))
+
+    # 主要依 MIDI 音域；邊界附近用持續時間作輕微偏好。
+    # 長音在中音域更常見於 pad/chord，所以不要輕易丟到 high。
+    if p < 55:
+        return L_OTHER_LOW
+    if p >= 76:
+        return L_OTHER_HIGH
+    if p >= 70 and d < 0.10:
+        return L_OTHER_HIGH
+    return L_OTHER_MID
+
+
+def piano_guitar_band_index(pitch):
+    """Phase D：回傳 Piano/Guitar 音域帶索引（0-3）。
+
+    分界 PIANO_GUITAR_BAND_BOUNDS = (48, 60, 72)：
+    0=<48（低音區）、1=48-59、2=60-71、3=>=72。
+    """
+    band = 0
+    for bound in PIANO_GUITAR_BAND_BOUNDS:
+        if int(pitch) >= int(bound):
+            band += 1
+    return band
+
+
+# ============================================================
+# Phase B：動態力度 / 立體聲 panning
+# ============================================================
+
+def apply_note_dynamics(
+    notes,
+    y,
+    sr,
+    vmin,
+    vmax,
+    smooth=3,
+):
+    """依 stem 音訊能量重寫每個音符的 velocity（3/4-tuple → 4-tuple）。
+
+    只在 --dynamics 開啟時呼叫；legacy preset 不會經過此函式，
+    因此舊輸出 byte 不變。
+    """
+
+    if not notes or y is None or len(y) == 0 or int(vmax) <= int(vmin):
+        return notes
+
+    y = np.asarray(y, dtype=np.float32)
+    total = int(y.shape[0])
+    n = len(notes)
+    rms = np.zeros(n, dtype=np.float64)
+
+    for i, note in enumerate(notes):
+        s = max(0, int(float(note[0]) * sr))
+        e = min(total, int(float(note[1]) * sr))
+        if e <= s:
+            e = min(total, s + 1)
+        if e <= s:
+            rms[i] = 1e-9
+            continue
+        seg = y[s:e]
+        rms[i] = float(np.sqrt(np.mean(seg * seg))) + 1e-9
+
+    db = 20.0 * np.log10(rms)
+    lo, hi = np.percentile(db, (10.0, 92.0))
+    if hi - lo < 3.0:
+        hi = lo + 3.0
+    norm = np.clip((db - lo) / (hi - lo), 0.0, 1.0)
+
+    # 依時間排序做 median 平滑，避免相鄰音符力度抖動。
+    order = np.argsort(
+        [float(note[0]) for note in notes],
+        kind="stable",
+    )
+    seq = norm[order]
+    if smooth and smooth >= 3 and seq.size >= smooth:
+        pad = smooth // 2
+        padded = np.pad(seq, pad, mode="edge")
+        seq = np.array(
+            [
+                np.median(padded[i:i + smooth])
+                for i in range(seq.size)
+            ],
+            dtype=np.float64,
+        )
+
+    velocity_sorted = int(vmin) + (int(vmax) - int(vmin)) * seq
+    velocity = np.empty(n, dtype=np.float64)
+    velocity[order] = velocity_sorted
+
+    out = []
+    for i, note in enumerate(notes):
+        out.append(
+            (
+                note[0],
+                note[1],
+                int(note[2]),
+                int(_clip(velocity[i], 1, 100)),
+            )
+        )
+    return out
+
+
+def dedup_notes_against_stems(
+    notes,
+    stem_notes,
+    min_overlap_ratio=0.5,
+    pitch_tol=1,
+    onset_tol=0.12,
+    stem_max_dur=8.0,
+):
+    """移除與 Piano/Guitar 音符重複的 Other 音符（Phase D）。
+
+    判定「同一實體發聲」需同時滿足三個條件：
+      1. 起音對齊：|Other 起音 - stem 起音| <= onset_tol（秒）。
+         同一顆琴音在兩次轉譜中的 onset 通常只差數十毫秒；
+         沒有這條的話，任何長 pad 只要與鋼琴音重疊就會整顆
+         被砍掉（實測會誤刪 85%）。
+      2. 音高接近：|pitch 差| <= pitch_tol（半音）。
+      3. 時間重疊 > min_overlap_ratio（相對兩者較短者）。
+
+    符合者從 Other 層丟棄，避免同一顆音同時出現在兩層造成
+    雙重音與音量疊加。
+    legacy preset 不呼叫此函式，舊輸出 byte 不變。
+    """
+
+    if not notes or not stem_notes:
+        return list(notes)
+
+    from bisect import bisect_left
+
+    refs = sorted(
+        (
+            float(n[0]),
+            float(n[1]),
+            int(n[2]),
+        )
+        for n in stem_notes
+    )
+    if not refs:
+        return list(notes)
+
+    starts = [r[0] for r in refs]
+    kept = []
+    removed = 0
+
+    for note in notes:
+        s = float(note[0])
+        e = float(note[1])
+        p = int(note[2])
+        dur = max(1e-6, e - s)
+
+        i = bisect_left(starts, s - float(stem_max_dur))
+        dup = False
+        while i < len(refs) and refs[i][0] <= e:
+            rs, re_, rp = refs[i]
+            if (
+                re_ > s
+                and abs(p - rp) <= int(pitch_tol)
+                and abs(s - rs) <= float(onset_tol)
+            ):
+                ov = min(e, re_) - max(s, rs)
+                if ov / min(dur, max(1e-6, re_ - rs)) > float(min_overlap_ratio):
+                    dup = True
+                    break
+            i += 1
+
+        if dup:
+            removed += 1
+        else:
+            kept.append(note)
+
+    print(
+        f"  Other 去重複：移除 {removed} / {len(notes)} 個"
+        "與 Piano/Guitar 重疊的音符"
+    )
+    return kept
+
+
+def stereo_pan_value(
+    y_stereo,
+    sr,
+    start,
+    end,
+    max_shift=45,
+    gain=8.0,
+):
+    """估算一段音訊的左右能量平衡，回傳 NBS panning。
+
+    NBS 規格：0 = 左 2 格、100 = 中央、200 = 右 2 格。
+    左聲道較大 → 回傳值 < 100。
+    """
+
+    if y_stereo is None:
+        return 100
+
+    y_stereo = np.asarray(y_stereo)
+    if y_stereo.ndim == 1:
+        y_stereo = np.vstack([y_stereo, y_stereo])
+
+    left = y_stereo[0]
+    right = y_stereo[1] if y_stereo.shape[0] >= 2 else y_stereo[0]
+
+    total = int(left.shape[0])
+    s = max(0, int(float(start) * sr))
+    e = min(total, int(max(float(end), float(start) + 0.03) * sr))
+    if e <= s:
+        return 100
+
+    el = float(np.mean(np.square(left[s:e], dtype=np.float64))) + 1e-12
+    er = float(np.mean(np.square(right[s:e], dtype=np.float64))) + 1e-12
+    db = 10.0 * np.log10(el / er)  # >0 代表偏左
+
+    shift = int(round(_clip(db * gain, -max_shift, max_shift)))
+    return int(_clip(100 - shift, 0, 200))
+
+
 def build_nbs_bytes(
     melody_notes,
     bass_notes,
@@ -2508,7 +3535,16 @@ def build_nbs_bytes(
     max_tick_shift=4,
     song_duration=None,
     other_retrigger_sec=0.25,
+    inst_map=None,
+    layer_panning=None,
+    piano_notes=None,
+    guitar_notes=None,
 ):
+
+    # 音色映射（preset + override 已在 main 解析）。
+    # 未指定時等同 legacy：保證舊呼叫端輸出不變。
+    if inst_map is None:
+        inst_map = dict(INSTRUMENT_PRESETS["legacy"])
 
     notes_by_layer_tick = {}
 
@@ -2593,7 +3629,13 @@ def build_nbs_bytes(
     # 主唱
     # ========================================================
 
-    for start, end, pitch in melody_notes:
+    melody_instrument = inst_map["melody"]
+
+    for note in melody_notes:
+
+        start = note[0]
+        end = note[1]
+        pitch = note[2]
 
         tick = int(
             round(
@@ -2605,19 +3647,40 @@ def build_nbs_bytes(
             end - start
         )
 
-        velocity = (
-            100
-            if duration < 0.1
-            else 92
+        if len(note) >= 4:
+            # Phase B 動態力度：直接用音訊能量算出的 velocity。
+            velocity = _clip(
+                int(note[3]),
+                1,
+                100,
+            )
+        else:
+            velocity = (
+                100
+                if duration < 0.1
+                else 92
+            )
+
+        key = midi_to_nbs_key(
+            pitch
         )
+
+        if melody_instrument == "auto":
+            # 依音域自動選：高音域用 bell（glockenspiel）增加亮度，
+            # 其餘維持 flute。
+            instrument = (
+                INSTR["bell"]
+                if key >= 55
+                else INSTR["flute"]
+            )
+        else:
+            instrument = INSTR[melody_instrument]
 
         add_note(
             L_MELODY,
             tick,
-            INSTR["flute"],
-            midi_to_nbs_key(
-                pitch
-            ),
+            instrument,
+            key,
             velocity,
         )
 
@@ -2625,7 +3688,11 @@ def build_nbs_bytes(
     # Bass
     # ========================================================
 
-    for start, end, pitch in bass_notes:
+    for note in bass_notes:
+
+        start = note[0]
+        end = note[1]
+        pitch = note[2]
 
         tick = int(
             round(
@@ -2637,16 +3704,24 @@ def build_nbs_bytes(
             end - start
         )
 
-        velocity = (
-            88
-            if duration < 0.15
-            else 78
-        )
+        if len(note) >= 4:
+            # Phase B 動態力度：直接用音訊能量算出的 velocity。
+            velocity = _clip(
+                int(note[3]),
+                1,
+                100,
+            )
+        else:
+            velocity = (
+                88
+                if duration < 0.15
+                else 78
+            )
 
         add_note(
             L_BASS,
             tick,
-            INSTR["bass"],
+            INSTR[inst_map["bass"]],
             midi_to_nbs_key(
                 pitch
             ),
@@ -2662,20 +3737,6 @@ def build_nbs_bytes(
     # 這只是聲部分群，不是樂器分類；目的是讓同一個 tick 能同時
     # 容納不同音域的 Other 音符，並讓 NBS 播放時不全部擠成一條線。
     # ========================================================
-
-    def classify_other_layer(pitch, duration):
-        p = int(pitch)
-        d = max(0.0, float(duration))
-
-        # 主要依 MIDI 音域；邊界附近用持續時間作輕微偏好。
-        # 長音在中音域更常見於 pad/chord，所以不要輕易丟到 high。
-        if p < 55:
-            return L_OTHER_LOW
-        if p >= 76:
-            return L_OTHER_HIGH
-        if p >= 70 and d < 0.10:
-            return L_OTHER_HIGH
-        return L_OTHER_MID
 
     for note in other_notes:
 
@@ -2748,15 +3809,16 @@ def build_nbs_bytes(
                 88,
             )
 
-            # 聲部使用不同音色只是「角色化」而非樂器辨識：
-            # Low 偏 guitar、Mid 保持 harp、High 偏 flute。
-            # 這能讓三個 Other layer 在實際播放時真的有可聽見的區別，
-            # 同時不宣稱我們已經知道原曲究竟是鋼琴、吉他還是 synth。
-            # Other 不使用 flute：高音也統一使用 harp，避免 flute 過於突出。
+            # 聲部音色由 preset 決定（legacy: guitar/harp/harp；
+            # pop: guitar/harp/pling）。這只是「角色化」而非樂器
+            # 辨識：不宣稱知道原曲究竟是鋼琴、吉他還是 synth。
+            # 真正的樂器分離（6-stem）會交給 Piano/Guitar 專層。
             if other_layer == L_OTHER_LOW:
-                other_instrument = INSTR["guitar"]
+                other_instrument = INSTR[inst_map["other_low"]]
+            elif other_layer == L_OTHER_HIGH:
+                other_instrument = INSTR[inst_map["other_high"]]
             else:
-                other_instrument = INSTR["harp"]
+                other_instrument = INSTR[inst_map["other_mid"]]
 
             add_note(
                 other_layer,
@@ -2798,16 +3860,18 @@ def build_nbs_bytes(
 
                 # 有真實 Bass 音符落在附近時，不再額外塞一個
                 # root，避免同一條 Bass 軌變成「真 Bass + 機械 root」雙重音。
+                # 注意：這裡的 bass_notes 可能是 3-tuple（快取原樣）
+                # 或 4-tuple（--dynamics 重寫後），只取 [0]/[2]。
                 has_real_bass = any(
-                    abs(float(bs) - float(beat)) < 0.08
-                    and int(round(bp)) % 12 == int(bass_midi) % 12
-                    for bs, be, bp in bass_notes
+                    abs(float(n[0]) - float(beat)) < 0.08
+                    and int(round(n[2])) % 12 == int(bass_midi) % 12
+                    for n in bass_notes
                 )
                 if not has_real_bass:
                     add_note(
                         L_BASS,
                         tick,
-                        INSTR["bass"],
+                        INSTR[inst_map["bass"]],
                         midi_to_nbs_key(
                             bass_midi
                         ),
@@ -2855,7 +3919,7 @@ def build_nbs_bytes(
                     add_note(
                         layer,
                         tick,
-                        INSTR["guitar"],
+                        INSTR[inst_map["chord"]],
                         midi_to_nbs_key(
                             chord_midi
                         ),
@@ -2896,6 +3960,67 @@ def build_nbs_bytes(
             ),
             collision_mode="replace_weaker",
         )
+
+    # ========================================================
+    # Piano / Guitar（Phase C/D 6-stem 級聯；未開啟時為空）
+    #
+    # Phase D：各依音域拆 4 個 band（分界 48/60/72）。
+    # 同 tick 同 band 仍用 replace_weaker（保留和弦中最強音），
+    # 但不同音域帶互不干涉 → 密集和弦不再被擠成單音。
+    # ========================================================
+
+    for source_notes, inst_key, band_layers in (
+        (piano_notes, "piano", L_PIANO_BANDS),
+        (guitar_notes, "guitar", L_GUITAR_BANDS),
+    ):
+
+        if not source_notes:
+            continue
+
+        for note in source_notes:
+
+            start = note[0]
+            end = note[1]
+            pitch = note[2]
+
+            layer = band_layers[
+                piano_guitar_band_index(pitch)
+            ]
+
+            start_tick = int(
+                round(
+                    start * tps
+                )
+            )
+
+            end_tick = int(
+                round(
+                    end * tps
+                )
+            )
+
+            if end_tick <= start_tick:
+                continue
+
+            if len(note) >= 4:
+                velocity = _clip(
+                    int(note[3]),
+                    18,
+                    100,
+                )
+            else:
+                velocity = 72
+
+            add_note(
+                layer,
+                start_tick,
+                INSTR[inst_map[inst_key]],
+                midi_to_nbs_key(
+                    pitch
+                ),
+                velocity,
+                collision_mode="replace_weaker",
+            )
 
     # ========================================================
     # Tick Map
@@ -2982,7 +4107,17 @@ def build_nbs_bytes(
 
     VERSION = 5
     VANILLA_COUNT = 16
-    LAYER_COUNT = 12
+
+    # 層數依實際用到的層決定：Piano/Guitar 級聯未開啟時仍是 12 層
+    # （舊輸出 byte 不變）；級聯開啟且有音符時自動擴充到 12-20 層
+    # （Piano 12-15、Guitar 16-19，Phase D 四音域帶）。
+    if notes_by_layer_tick:
+        layer_count = max(
+            12,
+            max(notes_by_layer_tick) + 1,
+        )
+    else:
+        layer_count = 12
 
     # --------------------------------------------------------
     # Header
@@ -3000,7 +4135,7 @@ def build_nbs_bytes(
     )
 
     w_u16(
-        LAYER_COUNT
+        layer_count
     )
 
     w_str(song_name)
@@ -3088,7 +4223,7 @@ def build_nbs_bytes(
     # --------------------------------------------------------
 
     for i in range(
-        LAYER_COUNT
+        layer_count
     ):
 
         w_str(
@@ -3100,7 +4235,11 @@ def build_nbs_bytes(
 
         w_u8(0)
         w_u8(100)
-        w_u8(100)
+        w_u8(
+            100
+            if not layer_panning
+            else int(layer_panning.get(i, 100))
+        )
 
     w_u8(0)
 
@@ -3284,6 +4423,51 @@ def filter_notes_by_vocal_activity(
 # Main
 # ============================================================
 
+# 找不到任何有效 Tempo、或偵測結果超出合理範圍時的保底值。
+DEFAULT_TPS = 40.0
+
+
+def auto_tps_from_tempo(
+    tempo_bpm,
+    subdivision=16,
+    min_tps=10.0,
+    max_tps=100.0,
+):
+    """依偵測到的 Tempo (BPM) 自動換算 tps。
+
+    tick 網格是否「對得上拍子」取決於每一拍能被切成整數個 tick；
+    這裡讓 tps = (BPM / 60) * subdivision，也就是每拍固定切成
+    `subdivision` 個 tick（預設 16，約當 120 BPM 時等同舊版固定
+    tps=40 的解析度），拍點必然落在整數 tick 上，不會像固定 tps
+    那樣跟原曲拍子對不齊；subdivision 越大，時間解析度越細，但
+    tps 也會等比例升高。
+
+    librosa 的節拍偵測常見「抓成一半或兩倍」的錯誤（例如把 140 BPM
+    誤判成 70 BPM），這裡先把 BPM 摺回 70~180 的常見流行樂範圍，
+    再換算 tps，並把最終結果夾在 [min_tps, max_tps] 之間，避免
+    畸零的 Tempo 估計值算出離譜的 tps。
+    """
+
+    if tempo_bpm is None or not np.isfinite(tempo_bpm) or tempo_bpm <= 0:
+        return DEFAULT_TPS, None
+
+    bpm = float(tempo_bpm)
+
+    while bpm < 70.0:
+        bpm *= 2.0
+    while bpm > 180.0:
+        bpm /= 2.0
+
+    tps = (bpm / 60.0) * subdivision
+    # 保留兩位小數（NBS 以 tps*100 存檔，可表達小數 tps）。
+    # 不可四捨五入成整數：例如 71.78 BPM → tps=19.14，16 分音符
+    # 恰為 4.0004 tick；若取整成 19 或 20，量化誤差會週期性累積
+    # 成聽得出來的「拍子飄」（swing）。
+    tps = float(np.clip(round(tps, 2), min_tps, max_tps))
+
+    return tps, bpm
+
+
 def main():
 
     conversion_start = time.perf_counter()
@@ -3316,8 +4500,13 @@ def main():
     ap.add_argument(
         "--tps",
         type=float,
-        default=40.0,
-        help="每秒 tick",
+        default=None,
+        help=(
+            "每秒 tick。預設不指定：會依偵測到的 Tempo (BPM) "
+            "自動計算，讓 tick 網格對齊拍點，避免節奏跟原曲對不上。"
+            "手動指定此參數會關閉自動 TPS，強制使用固定值"
+            "（例如 --tps 40）"
+        ),
     )
 
     ap.add_argument(
@@ -3340,6 +4529,17 @@ def main():
         type=int,
         default=None,
         help="Demucs segment",
+    )
+
+    ap.add_argument(
+        "--demucs-inprocess",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Demucs 使用 in-process API（預設開啟）：省掉 subprocess 每次重付的 "
+            "torch import + 模型載入。使用 --no-demucs-inprocess 可退回舊的 "
+            "subprocess 模式；in-process 初始化失敗時也會自動退回 subprocess。"
+        ),
     )
 
     ap.add_argument(
@@ -3395,6 +4595,114 @@ def main():
         default=OTHER_OCTAVE_SHIFT,
         help=(
             "Other 樂器升降八度"
+            "（預設: %(default)s）"
+        ),
+    )
+
+    # ========================================================
+    # 樂器 / 音色
+    # ========================================================
+
+    instrument_group = ap.add_argument_group(
+        "樂器 / 音色"
+    )
+
+    instrument_group.add_argument(
+        "--instrument-preset",
+        choices=sorted(INSTRUMENT_PRESETS),
+        default="pop",
+        help=(
+            "整體音色 preset。legacy = 加入 preset 前的舊音色；"
+            "pop = 鋼琴+吉他為主的流行編制（預設）；"
+            "另有 rock / synth / orchestra。"
+            "個別 --*-instrument 會覆蓋 preset。"
+            "（預設: %(default)s）"
+        ),
+    )
+
+    # (part, 顯示名, 是否允許 auto)
+    _part_instrument_specs = (
+        ("melody", "主唱", True),
+        ("bass", "Bass", False),
+        ("other_low", "Other 低音域", False),
+        ("other_mid", "Other 中音域", False),
+        ("other_high", "Other 高音域", False),
+        ("chord", "和弦", False),
+        ("piano", "Piano 層（6-stem）", False),
+        ("guitar", "Guitar 層（6-stem）", False),
+    )
+
+    for _part, _label, _allow_auto in _part_instrument_specs:
+
+        _choices = sorted(set(INSTR))
+
+        if _allow_auto:
+            _choices.append("auto")
+
+        instrument_group.add_argument(
+            f"--{_part.replace('_', '-')}-instrument",
+            dest=f"{_part}_instrument",
+            choices=_choices,
+            default=None,
+            help=(
+                f"{_label}音色；未指定時使用 preset。"
+                + (
+                    "auto = 依音域自動選"
+                    "（高音域用 bell，其餘 flute）。"
+                    if _allow_auto
+                    else ""
+                )
+            ),
+        )
+
+    # ========================================================
+    # 動態力度 / panning（Phase B）
+    # ========================================================
+
+    instrument_group.add_argument(
+        "--dynamics",
+        choices=("off", "melody", "bass", "both", "all"),
+        default=None,
+        help=(
+            "依 stem 音訊能量重寫每個音符的 velocity（力度起伏）。"
+            "both=主唱+Bass；all=再加上 Piano/Guitar/Other 伴奏"
+            "（Phase D）。"
+            "未指定時依 preset：legacy=off、其餘=all"
+        ),
+    )
+
+    instrument_group.add_argument(
+        "--panning",
+        choices=("off", "layer"),
+        default=None,
+        help=(
+            "依立體聲能量估算 Other/鼓各 layer 的 panning。"
+            "未指定時依 preset：legacy=off、其餘=layer"
+        ),
+    )
+
+    # ========================================================
+    # Piano/Guitar 級聯（Phase C）
+    # ========================================================
+
+    instrument_group.add_argument(
+        "--split-piano-guitar",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "用 htdemucs_6s 再分離出 Piano/Guitar 兩組獨立層"
+            "（各拆 Low/High），與 Other 重複的音自動去重。"
+            "Other 仍使用 4-Stem 版本。"
+            "未指定時依 preset：legacy=off、其餘=on。"
+            "（第一次使用會下載 6s 模型權重）"
+        ),
+    )
+
+    instrument_group.add_argument(
+        "--piano-guitar-model",
+        default="htdemucs_6s",
+        help=(
+            "Piano/Guitar 級聯使用的 Demucs 模型"
             "（預設: %(default)s）"
         ),
     )
@@ -3579,6 +4887,18 @@ def main():
         help="Bass 音高中值濾波窗口大小（預設: %(default)s）",
     )
 
+    bass_group.add_argument(
+        "--bass-backend",
+        choices=["pyin", "rmvpe"],
+        default="pyin",
+        help=(
+            "Bass 音高追蹤引擎（預設: %(default)s）。"
+            "pyin = 原本 librosa.pYIN（CPU，慢但為現行基準）；"
+            "rmvpe = 復用 RMVPE 模型跑 bass stem（GPU 上快很多，"
+            "輸出與 pYIN 略有差異，適合 A/B 比較）。"
+        ),
+    )
+
     # ========================================================
     # 和弦分析參數
     # ========================================================
@@ -3590,16 +4910,27 @@ def main():
     chord_group.add_argument(
         "--enable-chord-analysis",
         action="store_true",
-        default=False,
+        default=None,
         dest="enable_chord_analysis",
         help=(
-            "啟用和弦分析（預設: 關閉）。"
+            "啟用和弦分析（legacy preset 預設關閉，其餘 preset 預設開啟）。"
             "關閉時：跳過 chroma CQT 與和弦辨識，"
             "不會產生和弦琶音伴奏（L_CH_ROOT/3rd/5th/7th）、"
             "不會用和弦輔助主唱八度校正與 Bass 修正；"
             "Other 副旋律若是 hybrid/chord/mix 模式，"
             "會自動退化為純 extract。"
             "啟用時：恢復原本完整和弦進行分析與伴奏生成。"
+        ),
+    )
+
+    chord_group.add_argument(
+        "--no-chord-analysis",
+        action="store_false",
+        default=None,
+        dest="enable_chord_analysis",
+        help=(
+            "停用和弦分析（非 legacy preset 可用此旗標關閉；"
+            "行為與未加 --enable-chord-analysis 的舊版相同）。"
         ),
     )
 
@@ -3810,6 +5141,32 @@ def main():
     )
 
     other_group.add_argument(
+        "--other-neural-jobs",
+        type=int,
+        default=0,
+        help=(
+            "Other neural O&F 推理平行度（獨立 interpreter 數）。"
+            "0 = 自動（CPU 核心數/2，上限 4）；1 = 維持舊的序列推理。"
+            "gpu 引擎固定單模型序列推理，此值忽略"
+            "（預設: %(default)s）。"
+        ),
+    )
+
+    other_group.add_argument(
+        "--other-neural-engine",
+        choices=["auto", "tflite", "gpu"],
+        default="auto",
+        help=(
+            "Other neural O&F 推理引擎。"
+            "auto = 優先 WebGPU（D3D12, CompiledModel，實測比 tflite CPU "
+            "快約 2~3 倍且不吃 CPU），不可用時自動退回 tflite CPU；"
+            "tflite = 強制 CPU；gpu = 強制 WebGPU（失敗即報錯）。"
+            "legacy preset 一律強制 tflite 以確保輸出一致"
+            "（預設: %(default)s）。"
+        ),
+    )
+
+    other_group.add_argument(
         "--other-hop-length",
         type=int,
         default=256,
@@ -3954,12 +5311,12 @@ def main():
     nbs_group.add_argument(
         "--other-retrigger-sec",
         type=float,
-        default=0.0,
+        default=None,
         help=(
             "Other 長音在 NBS 中重新觸發的間隔（秒）。"
-            "0=不人工重敲（推薦，可避免迴音）；"
-            ">0 才啟用週期性 sustain 重觸發"
-            "（預設: %(default)s）"
+            "0=不人工重敲；>0 才啟用週期性 sustain 重觸發"
+            "（力度每次 -18，模擬持續音）。"
+            "未指定時依 preset：legacy=0、其餘=0.5"
         ),
     )
 
@@ -3977,6 +5334,120 @@ def main():
 
     args = ap.parse_args()
 
+    # 命令列是否出現過某個選項（給 preset 判斷「使用者是否明確指定」）。
+    _argv = sys.argv[1:]
+
+    def _arg_was_set(*names):
+        return any(
+            token == name or token.startswith(name + "=")
+            for token in _argv
+            for name in names
+        )
+
+    # ========================================================
+    # 樂器 preset 解析
+    # ========================================================
+    # preset 提供各聲部基準音色；命令列明確指定的
+    # --*-instrument 優先（default=None 代表未指定）。
+    # ========================================================
+    instrument_map = dict(
+        INSTRUMENT_PRESETS[args.instrument_preset]
+    )
+
+    for _part, _label, _allow_auto in _part_instrument_specs:
+        override = getattr(args, f"{_part}_instrument")
+        if override:
+            instrument_map[_part] = override
+
+    print(
+        f"樂器 preset：{args.instrument_preset}"
+        + (
+            ""
+            if all(
+                getattr(args, f"{p}_instrument") is None
+                for p, _, _ in _part_instrument_specs
+            )
+            else "（含命令列覆蓋）"
+        )
+    )
+    print(
+        "  "
+        + ", ".join(
+            f"{k}={v}" for k, v in instrument_map.items()
+        )
+    )
+
+    # 動態力度 / panning：未指定時依 preset 決定。
+    # legacy 一律關閉，確保舊輸出 byte 不變。
+    if args.dynamics is None:
+        args.dynamics = (
+            "off"
+            if args.instrument_preset == "legacy"
+            else "all"
+        )
+
+    if args.panning is None:
+        args.panning = (
+            "off"
+            if args.instrument_preset == "legacy"
+            else "layer"
+        )
+
+    print(
+        f"動態力度：{args.dynamics}"
+        f"，立體聲 panning：{args.panning}"
+    )
+
+    # Piano/Guitar 級聯：未指定時 legacy 關閉、其餘 preset 開啟。
+    if args.split_piano_guitar is None:
+        args.split_piano_guitar = (
+            args.instrument_preset != "legacy"
+        )
+
+    print(
+        "Piano/Guitar 級聯："
+        + (
+            f"on（model={args.piano_guitar_model}）"
+            if args.split_piano_guitar
+            else "off"
+        )
+    )
+
+    # 和弦分析（Phase E）：未指定時 legacy=off（舊行為）、
+    # 其餘 preset=on，讓 hybrid 模式能補上實際音符不足的空隙。
+    if args.enable_chord_analysis is None:
+        args.enable_chord_analysis = (
+            args.instrument_preset != "legacy"
+        )
+
+    print(
+        "和弦分析："
+        + ("啟用" if args.enable_chord_analysis else "關閉")
+    )
+
+    # O&F 推理引擎（Phase E）：legacy 一律 tflite（bitwise 回歸基準）；
+    # auto/gpu 的實際探測延後到 _resolve_of_engine（真的需要時才做）。
+    if args.instrument_preset == "legacy":
+        if args.other_neural_engine != "tflite":
+            print(
+                "  legacy preset：O&F 引擎強制 tflite（CPU）"
+                "以確保舊輸出 byte 一致"
+            )
+        args.other_neural_engine = "tflite"
+
+    # 長音續音（Phase D）：未指定時 legacy=0（舊行為）、
+    # 其餘 preset=0.5 秒（pad 持續音，補空隙）。
+    if args.other_retrigger_sec is None:
+        args.other_retrigger_sec = (
+            0.0
+            if args.instrument_preset == "legacy"
+            else 0.5
+        )
+
+    print(
+        f"長音續音（retrigger）：{args.other_retrigger_sec} 秒"
+    )
+
     # ========================================================
     # Other preset
     # ========================================================
@@ -3984,14 +5455,6 @@ def main():
     # 明確指定某個 --other-* 參數，就保留使用者自己的值。
     # ========================================================
     if args.other_preset == "piano":
-        argv = sys.argv[1:]
-
-        def _arg_was_set(*names):
-            return any(
-                token == name or token.startswith(name + "=")
-                for token in argv
-                for name in names
-            )
 
         piano_defaults = {
             "other_hop_length": 128,
@@ -4112,16 +5575,72 @@ def main():
             "[1/7] Demucs 4-Stem 分離"
         )
 
+        demucs_start = time.perf_counter()
+
         stems = separate_4stems(
             mp3_path,
             work_dir,
             model=args.demucs_model,
             device=args.device,
             segment=args.segment,
+            inprocess=args.demucs_inprocess,
         )
 
+        # ----------------------------------------------------
+        # Phase C/D：6-Stem 級聯（Piano / Guitar 獨立層）
+        #
+        # htdemucs_6s 會把 mix 再分成 6 軌；這裡只取 piano/guitar。
+        # Phase D 決策：Other 維持 4-Stem 版（內容最豐富），
+        # 鋼琴/吉他在 Other 中的重複音符由後段 dedup 去除，
+        # 不再換用較空的 6s other。
+        # legacy preset 不進這個分支，輸出與舊版完全相同。
+        # ----------------------------------------------------
+        if args.split_piano_guitar:
+
+            print(
+                f"6-Stem 級聯：{args.piano_guitar_model} "
+                f"分離 Piano/Guitar ..."
+            )
+
+            try:
+                stems6 = separate_4stems(
+                    mp3_path,
+                    work_dir,
+                    model=args.piano_guitar_model,
+                    device=args.device,
+                    segment=args.segment,
+                    inprocess=args.demucs_inprocess,
+                    stem_names=(
+                        "vocals",
+                        "drums",
+                        "bass",
+                        "other",
+                        "piano",
+                        "guitar",
+                    ),
+                )
+
+                # Phase D：Other 維持 4-Stem 版本（內容最豐富）。
+                # 6s 只用來取 Piano/Guitar 兩軌；與 Other 的重複
+                # 音符交由 dedup_notes_against_stems 在後段去除。
+                stems["piano"] = stems6["piano"]
+                stems["guitar"] = stems6["guitar"]
+
+                print(
+                    "  6-Stem 完成：Piano/Guitar 獨立分軌"
+                    "（Other 維持 4-Stem）"
+                )
+
+            except Exception as exc:
+                print(
+                    f"  [WARN] 6-Stem 級聯失敗"
+                    f"（{type(exc).__name__}: {exc}），"
+                    f"改用 4-Stem Other、不建立 Piano/Guitar 層。"
+                )
+                args.split_piano_guitar = False
+
         print(
-            "[1/7] 完成"
+            f"[1/7] 完成，耗時 {time.perf_counter() - demucs_start:.2f} 秒"
         )
 
         # ====================================================
@@ -4134,52 +5653,78 @@ def main():
         )
 
         print(
-            "  載入 vocals.wav ..."
+            "  平行載入 vocals/bass/other/drums ..."
         )
 
-        y_vocal, sr_v = (
-            librosa.load(
-                stems["vocals"],
+        load_start = time.perf_counter()
+
+        def _load_stem(key):
+            import librosa
+            return librosa.load(
+                stems[key],
                 sr=args.sr,
                 mono=True,
             )
-        )
+
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            fv = executor.submit(_load_stem, "vocals")
+            fb = executor.submit(_load_stem, "bass")
+            fo = executor.submit(_load_stem, "other")
+            fd = executor.submit(_load_stem, "drums")
+            y_vocal, sr_v = fv.result()
+            y_bass, sr_b = fb.result()
+            y_other, sr_o = fo.result()
+            y_drums, sr_d = fd.result()
 
         print(
-            "  vocals.wav 完成"
+            f"  4 stems 載入完成，耗時 {time.perf_counter() - load_start:.2f} 秒"
         )
 
-        print(
-            "  載入 bass.wav ..."
-        )
+        # 立體聲 panning 估算用的 stereo stems。
+        # 只在 --panning layer 時載入，legacy（off）完全不影響原本流程。
+        y_other_st = None
+        y_drums_st = None
+        y_piano_st = None
+        y_guitar_st = None
 
-        y_bass, sr_b = (
-            librosa.load(
-                stems["bass"],
+        def _load_stem_stereo(key):
+            import librosa
+            data, _sr = librosa.load(
+                stems[key],
+                sr=args.sr,
+                mono=False,
+            )
+            data = np.asarray(data)
+            if data.ndim == 1:
+                data = np.vstack([data, data])
+            return data
+
+        if args.panning == "layer":
+
+            print("  載入 stereo other/drums（panning 估算用） ...")
+            y_other_st = _load_stem_stereo("other")
+            y_drums_st = _load_stem_stereo("drums")
+
+        # Piano / Guitar 級聯音軌（Phase C）。
+        y_piano = None
+        y_guitar = None
+        if args.split_piano_guitar:
+
+            print("  載入 piano/guitar stems ...")
+            y_piano, _sr_p = librosa.load(
+                stems["piano"],
                 sr=args.sr,
                 mono=True,
             )
-        )
-
-        print(
-            "  bass.wav 完成"
-        )
-
-        print(
-            "  載入 other.wav ..."
-        )
-
-        y_other, sr_o = (
-            librosa.load(
-                stems["other"],
+            y_guitar, _sr_g = librosa.load(
+                stems["guitar"],
                 sr=args.sr,
                 mono=True,
             )
-        )
 
-        print(
-            "  other.wav 完成"
-        )
+            if args.panning == "layer":
+                y_piano_st = _load_stem_stereo("piano")
+                y_guitar_st = _load_stem_stereo("guitar")
 
         # Other 的 harmonic stem 會被純音樂旋律 / 和弦 / CQT 重複使用。
         # 將結果持久化，第二次執行可直接載入，避免再花 ~18 秒做 HPSS。
@@ -4205,22 +5750,6 @@ def main():
             np.save(hpss_cache, np.asarray(y_other_harm, dtype=np.float32), allow_pickle=False)
             print("  Other → harmonic/percussive 快取完成")
 
-        print(
-            "  載入 drums.wav ..."
-        )
-
-        y_drums, sr_d = (
-            librosa.load(
-                stems["drums"],
-                sr=args.sr,
-                mono=True,
-            )
-        )
-
-        print(
-            "  drums.wav 完成"
-        )
-
         assert (
             sr_v
             == sr_b
@@ -4233,11 +5762,107 @@ def main():
             "[2/7] 完成"
         )
 
+        # ------------------------------------------------
+        # 和弦關閉時的退化邏輯（提前計算，供 Phase E 預取、
+        # Wave B 與 [7/7] 共用）
+        # ------------------------------------------------
+        _chord_dependent_modes = ("hybrid", "chord", "mix")
+        if (
+            not args.enable_chord_analysis
+            and args.other_mode in _chord_dependent_modes
+        ):
+            print(
+                f"[警告] --other-mode={args.other_mode} 需要和弦資料，"
+                f"但 --enable-chord-analysis 未啟用。"
+            )
+            print(
+                "       自動退化為 extract 模式（純 CQT/Neural 抓音）。"
+            )
+            print(
+                "       若需要完整和弦伴奏，請加上 --enable-chord-analysis。"
+            )
+            effective_other_mode = "extract"
+        else:
+            effective_other_mode = args.other_mode
+
         other_cache_key = _cache_key_for_file(
             stems["other"],
             "other-neural-v1",
             args.sr,
         )
+
+        # ------------------------------------------------
+        # Phase E：O&F 背景預取（WebGPU）
+        #
+        # Other / Piano / Guitar 的 O&F 推理只依賴 stems 與快取，
+        # 因此在 [3/7]~[6/7] CPU 分析開跑前，先在背景把 GPU
+        # 推理做完：總時間 ≈ max(CPU 分析, GPU 推理) 而非相加。
+        # 只有 WebGPU 引擎可用時才啟用；tflite CPU 版維持
+        # 原本 Wave B 的錯開執行，避免 CPU 過度訂閱。
+        # ------------------------------------------------
+        of_prefetch = None
+        _neural_backend = (
+            getattr(args, "other_extract_backend", "neural") == "neural"
+        )
+        _prefetch_other = _neural_backend and (
+            effective_other_mode in ("hybrid", "extract", "mix")
+        )
+        _prefetch_pg = bool(
+            _neural_backend
+            and args.split_piano_guitar
+            and y_piano is not None
+        )
+        phase_d_overrides = {
+            "onset_threshold": 0.40,
+            "frame_threshold": 0.35,
+            "min_duration": 0.03,
+            "max_polyphony": 6,
+        }
+
+        if _prefetch_other or _prefetch_pg:
+            _prefetch_engine = _resolve_of_engine(
+                args.other_neural_model,
+                args.other_neural_engine,
+            )
+            if _prefetch_engine == "gpu":
+
+                def _of_prefetch_job():
+                    out = {}
+                    if _prefetch_other:
+                        out["other"] = run_other_extraction(
+                            y_other,
+                            args.sr,
+                            args,
+                            y_harm=y_other_harm,
+                            cache_key=other_cache_key,
+                            verbose=False,
+                        )
+                    if _prefetch_pg:
+                        for _label, _y_stem, _stem_key in (
+                            ("piano", y_piano, "piano"),
+                            ("guitar", y_guitar, "guitar"),
+                        ):
+                            _stem_cache_key = _cache_key_for_file(
+                                stems[_stem_key],
+                                "other-neural-v1",
+                                args.sr,
+                            )
+                            out[_label] = run_other_extraction(
+                                _y_stem,
+                                args.sr,
+                                args,
+                                y_harm=None,
+                                cache_key=_stem_cache_key,
+                                param_overrides=phase_d_overrides,
+                                verbose=False,
+                            )
+                    return out
+
+                print(
+                    "O&F 背景預取：GPU 推理將與 [3/7]~[6/7] CPU 分析重疊"
+                )
+                of_prefetch_executor = ThreadPoolExecutor(max_workers=1)
+                of_prefetch = of_prefetch_executor.submit(_of_prefetch_job)
 
         # ====================================================
         # [3/7] + [4/7] 主唱 + Bass pYIN
@@ -4297,127 +5922,270 @@ def main():
         )
 
         # --------------------------------------------------
-        # Vocal RMVPE + Bass pYIN 平行運算
+        # Bass 後端選擇（預設 pyin，輸出不變；rmvpe 復用主唱 ONNX 模型）
         # --------------------------------------------------
-        # 兩條 stem 完全獨立。改用 ThreadPoolExecutor 而不是
-        # multiprocessing，避免 Windows spawn 複製大型 numpy array，
-        # 也避免目前檔案裡原本不存在的 _melody_pyin_worker。
-        # RMVPE ONNX 與 librosa/NumPy 的重運算大多會釋放 GIL，
-        # 在這台多核心 CPU 上可以明顯縮短總等待時間。
+        bass_backend = getattr(args, "bass_backend", "pyin")
+        if bass_backend == "rmvpe":
+            print("  Bass 後端：RMVPE（與主唱共用 ONNX 模型）")
+            bass_fn = extract_melody_notes_rmvpe
+            bass_call_args = (y_bass, args.sr)
+            bass_kwargs = dict(
+                fmin_note=args.bass_fmin,
+                fmax_note=args.bass_fmax,
+                min_dur=args.bass_min_dur,
+                gap_tolerance=args.bass_gap_tolerance,
+                voiced_prob_thresh=args.bass_voiced_prob,
+                octave_shift=args.bass_octave_shift,
+                pitch_persistence_sec=args.bass_persistence,
+                medfilt_kernel_size=args.bass_medfilt_kernel,
+                # Bass 不做滑音吸附（min_note_dur=0 關閉），也不做 Rap 自適應。
+                min_note_dur=0.0,
+                rap_revise=False,
+                name="Bass",
+                device=args.device,
+                model_path=args.melody_rmvpe_model,
+                is_half=args.melody_rmvpe_half,
+                verbose_progress=False,
+            )
+        else:
+            if bass_backend != "pyin":
+                print(
+                    f"  [WARN] 未知的 --bass-backend={bass_backend!r}，"
+                    f"退回 pyin。"
+                )
+                bass_backend = "pyin"
+            bass_fn = extract_bass_notes_pyin
+            bass_call_args = (y_bass, args.sr)
+
+        # --------------------------------------------------
+        # Wave A：主唱 + Bass + 純音樂 fallback + 和弦/節拍 + Drums
+        # 五路平行（彼此獨立；八度校正與 [7/7] 組裝才需要 chords）。
+        # 各函式庫重運算（ONNX / NumPy / SciPy）大多會釋放 GIL，
+        # 在多核心 CPU 上總時間 ≈ max(五者) 而不是相加。
+        # --------------------------------------------------
         melody_kwargs["verbose_progress"] = False
-        print("平行模式：主唱 RMVPE + Bass pYIN 同時運算中 ...")
+        print("平行模式：主唱 + Bass + 純音樂 + 和弦 + Drums 同時運算中 ...")
         parallel_start = time.perf_counter()
 
-        with ThreadPoolExecutor(max_workers=2) as executor:
-            melody_future = executor.submit(
-                extract_melody_notes_rmvpe,
-                y_vocal,
-                args.sr,
-                **melody_kwargs,
-            )
-            bass_future = executor.submit(
-                extract_bass_notes_pyin,
-                y_bass,
-                args.sr,
-                verbose_progress=False,
-                **bass_kwargs,
-            )
-            melody_notes = melody_future.result()
-            bass_notes = bass_future.result()
+        def _notes_cache_key(stem_path, tag, kwargs):
+            parts = [tag, args.sr]
+            for k in sorted(kwargs):
+                if k in ("name", "verbose_progress"):
+                    continue
+                parts.append((k, repr(kwargs[k])))
+            return _cache_key_for_file(stem_path, *parts)
 
-        print(
-            f"平行分析完成：主唱 {len(melody_notes)} 個、"
-            f"Bass {len(bass_notes)} 個，"
-            f"耗時 {time.perf_counter() - parallel_start:.2f} 秒"
+        melody_cache_key = _notes_cache_key(
+            stems["vocals"], "melody-notes-v1", melody_kwargs
+        )
+        bass_cache_key = _notes_cache_key(
+            stems["bass"], f"bass-notes-v1-{bass_backend}", bass_kwargs
+        )
+        chord_cache_key = _cache_key_for_file(
+            stems["other"], "chords-v1", args.sr,
+            bool(args.enable_chord_analysis),
+        )
+        drum_cache_key = _cache_key_for_file(
+            stems["drums"], "drums-v1", args.sr
         )
 
-        # ----------------------------------------------------
-        # 純音樂段落 fallback
-        #
-        # mix 模式會在 [7/7] 自己依 vocals 能量選擇 extract，
-        # 因此這裡不能再先補一次，否則同一段 Other 旋律會重複。
-        # 其他模式維持原本的純音樂 fallback 行為。
-        # ----------------------------------------------------
-        if args.other_mode == "mix":
-            print(
-                "mix 模式：延後到 [7/7]，依 vocals.wav 能量切換 Other 策略"
-            )
-        else:
-            instrumental_melody = extract_instrumental_melody(
-                y_other,
-                y_vocal,
-                args.sr,
-                hop_length=256,
-                octave_shift=args.other_octave_shift,
-                y_harm=y_other_harm,
-            )
-
-            if instrumental_melody:
-                melody_notes = merge_melody_sources(
-                    melody_notes,
-                    instrumental_melody,
-                )
+        # 主唱 + Bass 音符持久化快取：命中即跳過音高追蹤。
+        # key 已含該軌全部轉譜參數，調參會自動重算。
+        melody_notes = None
+        bass_notes = None
+        for label, path in (
+            ("主唱", os.path.join(
+                _ensure_cache_dir("melody_notes"), melody_cache_key + ".npz")),
+            ("Bass", os.path.join(
+                _ensure_cache_dir("bass_notes"), bass_cache_key + ".npz")),
+        ):
+            if os.path.isfile(path):
+                notes, _ = _load_notes_npz(path)
                 print(
-                    f"純音樂段落：補入 {len(instrumental_melody)} 個 Other 旋律音符"
+                    f"  {label} → 使用持久化音符快取"
+                    f"（跳過音高追蹤）：{len(notes)} 個"
                 )
-            else:
-                print("純音樂段落：沒有需要補入的旋律")
+                if label == "主唱":
+                    melody_notes = notes
+                else:
+                    bass_notes = notes
 
-        print(
-            "[3/7][4/7] 完成"
-        )
+        # mix 模式會在 [7/7] 自己依 vocals 能量選擇 extract，
+        # 因此這裡不能先補純音樂旋律，否則同一段 Other 旋律會重複。
+        need_instrumental = (args.other_mode != "mix")
 
-        # ====================================================
-        # [5/7] 和弦 + Drums 可並行
-        #
-        # 兩者都只讀自己的音訊；和弦也只依賴已完成的 Other harmonic
-        # cache，因此不需要互相等待。
-        #
-        # 若 --enable-chord-analysis 未指定，analyze_chords 會退化
-        # 為純 beat tracking，仍回傳 other_beat_times / chord_tempo，
-        # 但 chords = []，因此後續和弦伴奏 / Bass 聯動 / 八度校正
-        # 都會自動跳過和弦相關分支。
-        # ====================================================
-
-        if args.enable_chord_analysis:
-            print()
-            print("[5/7] Other 和弦分析 + [6/7] Drums 分析（平行）")
-        else:
-            print()
-            print(
-                "[5/7] Other 節拍分析（和弦分析已關閉）"
-                " + [6/7] Drums 分析（平行）"
-            )
-        chord_drum_start = time.perf_counter()
-        with ThreadPoolExecutor(max_workers=2) as executor:
-            chord_future = executor.submit(
-                analyze_chords,
+        with ThreadPoolExecutor(max_workers=5) as executor:
+            futs = {}
+            if melody_notes is None:
+                futs["melody"] = executor.submit(
+                    extract_melody_notes_rmvpe,
+                    y_vocal,
+                    args.sr,
+                    **melody_kwargs,
+                )
+            if bass_notes is None:
+                if bass_backend == "rmvpe":
+                    futs["bass"] = executor.submit(
+                        bass_fn,
+                        *bass_call_args,
+                        **bass_kwargs,
+                    )
+                else:
+                    futs["bass"] = executor.submit(
+                        bass_fn,
+                        *bass_call_args,
+                        verbose_progress=False,
+                        **bass_kwargs,
+                    )
+            if need_instrumental:
+                futs["inst"] = executor.submit(
+                    extract_instrumental_melody,
+                    y_other,
+                    y_vocal,
+                    args.sr,
+                    hop_length=256,
+                    octave_shift=args.other_octave_shift,
+                    y_harm=y_other_harm,
+                )
+            futs["chord"] = executor.submit(
+                _cached_analyze_chords,
                 y_other,
                 args.sr,
-                y_harm=y_other_harm,
-                chord_analysis=args.enable_chord_analysis,
+                y_other_harm,
+                args.enable_chord_analysis,
+                chord_cache_key,
             )
-            drums_future = executor.submit(
-                analyze_drums,
+            futs["drums"] = executor.submit(
+                _cached_analyze_drums,
                 y_drums,
                 args.sr,
+                drum_cache_key,
+            )
+
+            if melody_notes is None:
+                melody_notes = futs["melody"].result()
+                _save_notes_npz(
+                    os.path.join(
+                        _ensure_cache_dir("melody_notes"),
+                        melody_cache_key + ".npz",
+                    ),
+                    melody_notes,
+                )
+            if bass_notes is None:
+                bass_notes = futs["bass"].result()
+                _save_notes_npz(
+                    os.path.join(
+                        _ensure_cache_dir("bass_notes"),
+                        bass_cache_key + ".npz",
+                    ),
+                    bass_notes,
+                )
+            instrumental_melody = (
+                futs["inst"].result() if "inst" in futs else []
             )
             (
                 chords,
                 other_beat_times,
                 chord_tempo,
-            ) = chord_future.result()
+            ) = futs["chord"].result()
             (
                 onset_times,
                 onset_env,
                 env_times,
                 drum_beat_times,
                 drum_tempo,
-            ) = drums_future.result()
+            ) = futs["drums"].result()
 
         print(
-            f"和弦 + Drums 平行完成，耗時 {time.perf_counter() - chord_drum_start:.2f} 秒"
+            f"平行分析完成：主唱 {len(melody_notes)} 個、"
+            f"Bass {len(bass_notes)} 個、"
+            f"純音樂 {len(instrumental_melody)} 個、"
+            f"和弦 {len(chords)} 段、"
+            f"Drums onset {len(onset_times)} 個，"
+            f"耗時 {time.perf_counter() - parallel_start:.2f} 秒"
         )
+
+        # ------------------------------------------------
+        # 主唱八度檢核：偏離局部音域基準的音，用 vocals
+        # 音訊的諧波結構驗證該留在哪個八度（修 RMVPE 的
+        # 八度 / 次諧波 dive，不會誤折真實的高音段落）
+        # ------------------------------------------------
+
+        if melody_notes:
+
+            _pre_fold = list(melody_notes)
+
+            melody_notes = fold_melody_register(
+                melody_notes,
+                y_vocal,
+                args.sr,
+            )
+
+            _n_fixed = sum(
+                1
+                for (_, _, a), (_, _, b)
+                in zip(_pre_fold, melody_notes)
+                if a != b
+            )
+
+            if _n_fixed:
+                print(
+                    f"  主唱八度檢核：修正 {_n_fixed} 個音"
+                )
+
+        # ------------------------------------------------
+        # 純音樂段旋律：先對齊到鄰近主唱音域，再合併；
+        # 避免 merge 後在段落交界出現 2 個八度以上的大跌落
+        # ------------------------------------------------
+
+        if instrumental_melody and melody_notes:
+
+            _pre_align = list(instrumental_melody)
+
+            instrumental_melody = align_instrumental_register(
+                instrumental_melody,
+                melody_notes,
+            )
+
+            _n_aligned = sum(
+                1
+                for (_, _, a), (_, _, b)
+                in zip(_pre_align, instrumental_melody)
+                if a != b
+            )
+
+            if _n_aligned:
+                print(
+                    f"  純音樂旋律音域對齊：調整 {_n_aligned} 個音"
+                )
+
+        if args.other_mode == "mix":
+            print(
+                "mix 模式：延後到 [7/7]，依 vocals.wav 能量切換 Other 策略"
+            )
+        elif instrumental_melody:
+            melody_notes = merge_melody_sources(
+                melody_notes,
+                instrumental_melody,
+            )
+            print(
+                f"純音樂段落：補入 {len(instrumental_melody)} 個 Other 旋律音符"
+            )
+        else:
+            print("純音樂段落：沒有需要補入的旋律")
+
+        print(
+            "[3/7][4/7] 完成"
+        )
+
+        # ====================================================
+        # [5/7] 和弦 + [6/7] Drums：已在 Wave A 五路平行完成。
+        #
+        # 若 --enable-chord-analysis 未指定，analyze_chords 會退化
+        # 為純 beat tracking，仍回傳 other_beat_times / chord_tempo，
+        # 但 chords = []，因此後續和弦伴奏 / Bass 聯動 / 八度校正
+        # 都會自動跳過和弦相關分支。
+        # ====================================================
 
         # ------------------------------------------------
         # 修正主唱偶爾抓錯八度的孤立音
@@ -4529,6 +6297,43 @@ def main():
             )
 
         # ====================================================
+        # TPS：未手動指定時自動依 Tempo 換算
+        # ====================================================
+
+        if args.tps is None:
+
+            # 優先採用 Drums 的 Tempo（鼓點通常比 Other 更貼近實際節拍），
+            # 沒有 Drums beat 時退回 Other/Chord 分析得到的 Tempo。
+            tempo_for_tps = (
+                drum_tempo
+                if len(drum_beat_times) > 0 and drum_tempo
+                else chord_tempo
+            )
+
+            auto_tps, normalized_bpm = auto_tps_from_tempo(
+                tempo_for_tps
+            )
+
+            args.tps = auto_tps
+
+            if normalized_bpm is not None:
+                print(
+                    f"自動 TPS：偵測 Tempo 約 {normalized_bpm:.1f} BPM "
+                    f"→ tps={args.tps:.2f}"
+                )
+            else:
+                print(
+                    f"自動 TPS：未偵測到可用 Tempo，"
+                    f"使用預設 tps={args.tps:.1f}"
+                )
+
+        else:
+            print(
+                f"使用手動指定 TPS：{args.tps:.1f}"
+                "（已停用自動 TPS）"
+            )
+
+        # ====================================================
         # 設計鼓組節奏（含音量起伏，避免節拍器感）
         # ====================================================
 
@@ -4555,6 +6360,106 @@ def main():
             f"{len(drum_hits)} 個鼓點"
         )
 
+        # ------------------------------------------------
+        # Wave B：Other 實際音符抽取（CQT / O&F neural）。
+        # 只依賴 other.wav + 快取，不依賴 chords；放在 Wave A 之後
+        # 是為了與 pYIN 等 CPU 重任務錯開，避免過度訂閱。
+        # O&F 內部已用多 worker 平行（--other-neural-jobs）。
+        # chord 模式不需要實際音符，直接跳過。
+        # Phase E：WebGPU 引擎時已在 [2/7] 後背景預取，
+        # 這裡直接取用結果（見上方 _of_prefetch）。
+        # ------------------------------------------------
+        extracted_pre = None
+        if effective_other_mode in ("hybrid", "extract", "mix"):
+            if of_prefetch is not None and _prefetch_other:
+                print()
+                print("[7/7] Other 實際音符抽取（背景預取結果） ...")
+                extracted_pre = of_prefetch.result()["other"]
+                print(
+                    f"  Other 實際音符抽取完成：{len(extracted_pre)} 個"
+                    "（背景執行，已與 [3/7]~[6/7] 重疊）"
+                )
+            else:
+                print()
+                print("[7/7] Other 實際音符抽取（與 Wave A 錯開執行） ...")
+                extract_start = time.perf_counter()
+                extracted_pre = run_other_extraction(
+                    y_other,
+                    args.sr,
+                    args,
+                    y_harm=y_other_harm,
+                    cache_key=other_cache_key,
+                )
+                print(
+                    f"  Other 實際音符抽取完成：{len(extracted_pre)} 個，"
+                    f"耗時 {time.perf_counter() - extract_start:.2f} 秒"
+                )
+
+        # ------------------------------------------------
+        # Phase C/D：Piano / Guitar 分軌轉譜
+        #
+        # 使用與 Other 相同的 backend，但改用較寬鬆的 O&F
+        # 參數（Phase D）：onset/frame threshold 降低可救回
+        # 更多和弦內音，max_polyphony 4→6、min_duration
+        # 0.035→0.03 讓短琶音與裝飾音不被濾掉。
+        # 各自獨立快取（key 含 stem 路徑與參數，不互相污染）。
+        # ------------------------------------------------
+        piano_notes = []
+        guitar_notes = []
+        if args.split_piano_guitar and y_piano is not None:
+
+            print()
+            print("[7/7] Piano/Guitar 分軌轉譜 ...")
+
+            if of_prefetch is not None and _prefetch_pg:
+                _pg_bundle = of_prefetch.result()
+                piano_notes = _pg_bundle.get("piano", [])
+                guitar_notes = _pg_bundle.get("guitar", [])
+                print(
+                    f"  Piano：{len(piano_notes)} 個音符"
+                    "（背景執行，已與 [3/7]~[6/7] 重疊）"
+                )
+                print(
+                    f"  Guitar：{len(guitar_notes)} 個音符"
+                    "（背景執行，已與 [3/7]~[6/7] 重疊）"
+                )
+            else:
+                for label, y_stem, stem_key in (
+                    ("Piano", y_piano, "piano"),
+                    ("Guitar", y_guitar, "guitar"),
+                ):
+
+                    stem_cache_key = _cache_key_for_file(
+                        stems[stem_key],
+                        "other-neural-v1",
+                        args.sr,
+                    )
+
+                    y_harm_stem = None
+                    if getattr(args, "other_extract_backend", "neural") == "cqt":
+                        y_harm_stem, _h = librosa.effects.hpss(
+                            y_stem,
+                            margin=(1.0, 3.0),
+                        )
+
+                    stem_notes = run_other_extraction(
+                        y_stem,
+                        args.sr,
+                        args,
+                        y_harm=y_harm_stem,
+                        cache_key=stem_cache_key,
+                        param_overrides=phase_d_overrides,
+                    )
+
+                    if label == "Piano":
+                        piano_notes = stem_notes
+                    else:
+                        guitar_notes = stem_notes
+
+                    print(
+                        f"  {label}：{len(stem_notes)} 個音符"
+                    )
+
         # ====================================================
         # [7/7] 副旋律（Other）
         #
@@ -4568,29 +6473,25 @@ def main():
         # 都需要和弦資料，因此自動退化為 extract 模式，並印出警告。
         # ====================================================
 
-        print()
+        # Phase E：去重複只作用在「O&F 實際抽取音」。
+        # 和弦補缺 / 和弦伴奏（generate_chord_accompaniment）不與
+        # Piano/Guitar 去重——它們補的正是 O&F 沒抓到、但鋼琴/
+        # 吉他層也可能有的空隙，去重會把補上的音整批吃掉。
+        def _dedup_extracted(notes):
+            notes = list(notes)
+            if not notes:
+                return notes
+            if not (
+                args.split_piano_guitar
+                and (piano_notes or guitar_notes)
+            ):
+                return notes
+            return dedup_notes_against_stems(
+                notes,
+                list(piano_notes) + list(guitar_notes),
+            )
 
-        # ------------------------------------------------
-        # 和弦關閉時的退化邏輯
-        # ------------------------------------------------
-        _chord_dependent_modes = ("hybrid", "chord", "mix")
-        if (
-            not args.enable_chord_analysis
-            and args.other_mode in _chord_dependent_modes
-        ):
-            print(
-                f"[警告] --other-mode={args.other_mode} 需要和弦資料，"
-                f"但 --enable-chord-analysis 未啟用。"
-            )
-            print(
-                "       自動退化為 extract 模式（純 CQT/Neural 抓音）。"
-            )
-            print(
-                "       若需要完整和弦伴奏，請加上 --enable-chord-analysis。"
-            )
-            effective_other_mode = "extract"
-        else:
-            effective_other_mode = args.other_mode
+        print()
 
         if effective_other_mode == "hybrid":
 
@@ -4598,12 +6499,9 @@ def main():
                 "[7/7] Other HYBRID：實際音符優先 + 和弦補缺"
             )
 
-            extracted_notes = run_other_extraction(
-                y_other,
-                args.sr,
-                args,
-                y_harm=y_other_harm,
-                cache_key=other_cache_key,
+            # 實際音符已在 Wave B 抽取完成，這裡直接取用。
+            extracted_notes = (
+                list(extracted_pre) if extracted_pre is not None else []
             )
 
             generated_chords = generate_chord_accompaniment(
@@ -4622,8 +6520,8 @@ def main():
             # 只用和弦填「實際 Other 音符沒有覆蓋」的部分。
             # 若兩者在時間上重疊且 pitch 相同/相差一個八度，
             # 視為原曲已經有這個聲部，不再重複塞一顆機械音。
-            other_notes = list(extracted_notes)
-            fallback_count = 0
+            # 補缺判定用抽取音全集；去重複只移除被抽取的那批。
+            chord_fills = []
             for chord_note in generated_chords:
                 cs, ce, cp = chord_note[:3]
                 covered = False
@@ -4634,13 +6532,14 @@ def main():
                             covered = True
                             break
                 if not covered:
-                    other_notes.append(chord_note)
-                    fallback_count += 1
+                    chord_fills.append(chord_note)
 
+            other_notes = _dedup_extracted(extracted_notes) + chord_fills
             other_notes.sort(key=lambda x: (x[0], x[2]))
             print(
-                f"  HYBRID：實際音符 {len(extracted_notes)} 個，"
-                f"和弦補缺 {fallback_count} 個，"
+                f"  HYBRID：實際音符 {len(extracted_notes)} 個"
+                f"（去重後 {len(other_notes) - len(chord_fills)} 個），"
+                f"和弦補缺 {len(chord_fills)} 個，"
                 f"合計 {len(other_notes)} 個"
             )
 
@@ -4693,12 +6592,8 @@ def main():
                 "[7/7] Other 樂器簡化音符分析（extract 模式）"
             )
 
-            other_notes = run_other_extraction(
-                y_other,
-                args.sr,
-                args,
-                y_harm=y_other_harm,
-                cache_key=other_cache_key,
+            other_notes = _dedup_extracted(
+                extracted_pre if extracted_pre is not None else []
             )
 
         else:
@@ -4748,13 +6643,9 @@ def main():
                 f"  MIX chord：保留 {len(vocal_chord_notes)} / {len(chord_notes_all)} 個音符（有人聲區段）"
             )
 
-            # extract 只在無人聲區段啟用。
-            extracted_all = run_other_extraction(
-                y_other,
-                args.sr,
-                args,
-                y_harm=y_other_harm,
-                cache_key=other_cache_key,
+            # extract 只在無人聲區段啟用（已在 Wave B 抽取完成）。
+            extracted_all = (
+                list(extracted_pre) if extracted_pre is not None else []
             )
 
             # extract 也使用同一個密集 vocal mask，保證切換邏輯一致。
@@ -4767,6 +6658,10 @@ def main():
 
             print(
                 f"  MIX extract：保留 {len(instrumental_extract_notes)} / {len(extracted_all)} 個音符（無人聲區段）"
+            )
+
+            instrumental_extract_notes = _dedup_extracted(
+                instrumental_extract_notes
             )
 
             # 兩邊的條件互斥，因此人聲段不會被 extract 污染，
@@ -4784,6 +6679,148 @@ def main():
         print(
             "[7/7] 完成"
         )
+
+        # ====================================================
+        # Phase B/D：動態力度 / layer panning
+        # （preset=legacy 時全部 off，輸出與舊版 byte 相同）
+        # Phase E：Other 去重複已移到 [7/7] 各分支（只作用抽取音）
+        # ====================================================
+
+        if args.dynamics in ("melody", "both", "all") and melody_notes:
+            melody_notes = apply_note_dynamics(
+                melody_notes,
+                y_vocal,
+                args.sr,
+                66,
+                100,
+            )
+            print(
+                f"主唱動態力度：{len(melody_notes)} 個音符"
+            )
+
+        if args.dynamics in ("bass", "both", "all") and bass_notes:
+            bass_notes = apply_note_dynamics(
+                bass_notes,
+                y_bass,
+                args.sr,
+                58,
+                92,
+            )
+            print(
+                f"Bass 動態力度：{len(bass_notes)} 個音符"
+            )
+
+        # Phase D：伴奏動態力度（Piano/Guitar/Other 各自套 RMS）。
+        # Other 保留在 build 內乘 OTHER_VELOCITY_SCALE，因此
+        # 這裡用較高範圍（50–95）補償。
+        if args.dynamics == "all":
+            if piano_notes and y_piano is not None:
+                piano_notes = apply_note_dynamics(
+                    piano_notes,
+                    y_piano,
+                    args.sr,
+                    40,
+                    95,
+                )
+                print(
+                    f"Piano 動態力度：{len(piano_notes)} 個音符"
+                )
+            if guitar_notes and y_guitar is not None:
+                guitar_notes = apply_note_dynamics(
+                    guitar_notes,
+                    y_guitar,
+                    args.sr,
+                    40,
+                    95,
+                )
+                print(
+                    f"Guitar 動態力度：{len(guitar_notes)} 個音符"
+                )
+            if other_notes and y_other_st is not None:
+                other_notes = apply_note_dynamics(
+                    other_notes,
+                    y_other_st,
+                    args.sr,
+                    50,
+                    95,
+                )
+                print(
+                    f"Other 動態力度：{len(other_notes)} 個音符"
+                )
+
+        layer_panning = None
+        if args.panning == "layer":
+
+            pans_by_layer = {}
+
+            if other_notes and y_other_st is not None:
+                for note in other_notes:
+                    pans_by_layer.setdefault(
+                        classify_other_layer(
+                            note[2],
+                            float(note[1]) - float(note[0]),
+                        ),
+                        [],
+                    ).append(
+                        stereo_pan_value(
+                            y_other_st,
+                            args.sr,
+                            note[0],
+                            note[1],
+                        )
+                    )
+
+            if drum_hits and y_drums_st is not None:
+                for layer, t, _vel in drum_hits:
+                    pans_by_layer.setdefault(
+                        layer,
+                        [],
+                    ).append(
+                        stereo_pan_value(
+                            y_drums_st,
+                            args.sr,
+                            max(0.0, float(t) - 0.01),
+                            float(t) + 0.06,
+                        )
+                    )
+
+            for notes_list, y_st, band_layers in (
+                (piano_notes, y_piano_st, L_PIANO_BANDS),
+                (guitar_notes, y_guitar_st, L_GUITAR_BANDS),
+            ):
+                if notes_list and y_st is not None:
+                    for note in notes_list:
+                        pans_by_layer.setdefault(
+                            band_layers[
+                                piano_guitar_band_index(note[2])
+                            ],
+                            [],
+                        ).append(
+                            stereo_pan_value(
+                                y_st,
+                                args.sr,
+                                note[0],
+                                note[1],
+                            )
+                        )
+
+            layer_panning = {
+                layer: int(round(float(np.median(vals))))
+                for layer, vals in pans_by_layer.items()
+                if vals
+            }
+
+            print(
+                "Layer panning："
+                + (
+                    ", ".join(
+                        f"{LAYER_NAMES.get(k, k)}={v}"
+                        for k, v in sorted(layer_panning.items())
+                    )
+                    if layer_panning
+                    else "無"
+                )
+            )
 
         # ====================================================
         # NBS
@@ -4818,6 +6855,11 @@ def main():
             description=(
                 "Demucs 4-Stem "
                 "vocals+bass+other+drums"
+                + (
+                    ""
+                    if args.instrument_preset == "legacy"
+                    else f" [preset={args.instrument_preset}]"
+                )
             ),
 
             song_duration=(
@@ -4831,6 +6873,14 @@ def main():
             other_retrigger_sec=(
                 args.other_retrigger_sec
             ),
+
+            inst_map=instrument_map,
+
+            layer_panning=layer_panning,
+
+            piano_notes=piano_notes,
+
+            guitar_notes=guitar_notes,
         )
 
         print(
@@ -5207,7 +7257,7 @@ def analyze_drums(y_drums, sr, hop_length=512):
 def design_drum_hits(beat_times, onset_strength_env, env_times,
                      hop_length=512, sr=22050, seed=0,
                      onset_times=None, y_drums=None):
-    """依原始 drums onset + 頻譜重心分類 Kick/Snare/Hat。"""
+    """依原始 drums onset 窄帶比例分類 Kick/Snare/Hat（16 分格對齊）。"""
     import librosa
     rng = np.random.default_rng(seed)
     if y_drums is None or onset_times is None or len(onset_times) == 0:
@@ -5227,34 +7277,79 @@ def design_drum_hits(beat_times, onset_strength_env, env_times,
     onset_times = np.asarray(onset_times, dtype=float)
     n_fft = 2048
     hop = max(128, hop_length)
-    S = np.abs(librosa.stft(y, n_fft=n_fft, hop_length=hop))
     freqs = librosa.fft_frequencies(sr=sr, n_fft=n_fft)
-    low = freqs < 180.0
-    mid = (freqs >= 180.0) & (freqs < 4000.0)
-    high = freqs >= 4000.0
+    # 原本對整首歌做一次 STFT 再逐 onset 取一個 frame；
+    # 改為只對每個 onset 中心 ±n_fft/2 的切片做 rfft。
+    # 切片方式與 librosa.stft(center=True, hann, reflect pad) 等價，
+    # 省掉整曲 STFT（O(全曲) → O(onset 數 × 2048)）。
+    from scipy.signal import get_window as _get_window
+    _drum_window = _get_window("hann", n_fft, fftbins=True).astype(float)
+    _pad = n_fft // 2
+    _y_padded = np.pad(y, _pad, mode="reflect") if len(y) else y
+
+    def _onset_spec(t):
+        frame = int(round(float(t) * sr / hop))
+        center = frame * hop
+        seg = _y_padded[center:center + n_fft]
+        if len(seg) < n_fft:
+            seg = np.pad(seg, (0, n_fft - len(seg)))
+        return np.abs(np.fft.rfft(seg * _drum_window, n=n_fft))
+    # 頻帶：low < 150、body 150-2500、high >= 2500。
+    # body 上限從 4000 收到 2500：hi-hat 的 3-4kHz 能量原本會被
+    # 算進 body，讓大量 hat 被誤判成 Snare。
+    low = freqs < 150.0
+    body = (freqs >= 150.0) & (freqs < 2500.0)
+    high = freqs >= 2500.0
     env = np.asarray(onset_strength_env)
     env_ref = max(1e-6, float(np.percentile(env, 98))) if len(env) else 1.0
 
+    # onset 對齊 16 分格：實際打點與偵測結果通常差 <30ms，
+    # snap 掉偵測抖動、讓節奏格線與 beats 完全一致（誤差 >45ms
+    # 視為非格內音，保留原時間）。
+    snapped_times = [float(t) for t in onset_times]
+    if len(beat_times) >= 2:
+        beats_arr = np.asarray(beat_times, dtype=float)
+        sub_interval = float(np.median(np.diff(beats_arr))) / 4.0
+        if sub_interval > 1e-3:
+            new_times = []
+            for t in snapped_times:
+                pos = int(np.searchsorted(beats_arr, t))
+                best = t
+                best_err = 45e-3 + 1e-9
+                for j in (pos - 1, pos, pos + 1):
+                    if 0 <= j < len(beats_arr):
+                        base_t = float(beats_arr[j])
+                        for m in range(-2, 6):
+                            cand = base_t + m * sub_interval
+                            err = abs(cand - t)
+                            if err < best_err:
+                                best_err = err
+                                best = cand
+                new_times.append(best)
+            snapped_times = new_times
+
     hits = []
-    for t in onset_times:
-        frame = int(np.clip(round(t * sr / hop), 0, S.shape[1] - 1))
-        spec = S[:, frame]
+    for t in snapped_times:
+        spec = _onset_spec(t)
         total = float(spec.sum()) + 1e-9
         low_ratio = float(spec[low].sum()) / total
-        mid_ratio = float(spec[mid].sum()) / total
+        body_ratio = float(spec[body].sum()) / total
         high_ratio = float(spec[high].sum()) / total
         env_i = int(np.clip(round(t * sr / hop_length), 0, len(env) - 1)) if len(env) else 0
         strength = float(env[env_i]) if len(env) else 0.0
         norm = min(1.0, strength / env_ref)
 
-        # 一個 onset 可以同時包含 Kick + Hat、Snare + Hat 等多層鼓聲。
-        # 不同 layer 可以同時存在；只有同一 layer 的近鄰重複 onset 才合併。
+        # 一個 onset 可以同時包含 Kick + Hat 等多層鼓聲；
+        # 只有同一 layer 的近鄰重複 onset 才合併。
+        # 三條規則都要求「主導頻帶」明顯勝過其他頻帶，避免單一
+        # onset 同時觸發 Kick+Snare+Hat；落在規則之間（例如
+        # Snare 與 Hat 疊打）的音交給 fallback 依重心判定。
         layers = []
-        if low_ratio >= 0.34 and low_ratio > high_ratio * 1.05:
+        if low_ratio >= 0.30 and low_ratio > body_ratio * 1.1:
             layers.append((L_KICK, 62))
-        if high_ratio >= 0.30 and high_ratio > low_ratio * 0.65:
+        if high_ratio >= 0.55 and high_ratio > body_ratio * 1.5:
             layers.append((L_HAT, 36))
-        if mid_ratio >= 0.20 and (mid_ratio + high_ratio) >= 0.32:
+        if body_ratio >= 0.35 and body_ratio > low_ratio * 1.5 and body_ratio > high_ratio * 0.85:
             layers.append((L_SNARE, 55))
         if not layers:
             centroid = float((freqs * spec).sum() / total)
@@ -5278,6 +7373,96 @@ def design_drum_hits(beat_times, onset_strength_env, env_times,
     hits.sort(key=lambda x: x[1])
     print(f"  鼓組：依原始 onset 還原 {len(hits)} 個鼓點")
     return hits
+
+
+def _save_chords_npz(path, chords, beat_times, tempo):
+    np.savez_compressed(
+        path,
+        start=np.asarray([c[0] for c in chords], dtype=np.float64),
+        end=np.asarray([c[1] for c in chords], dtype=np.float64),
+        root=np.asarray([c[2] for c in chords], dtype=np.int16),
+        quality=np.asarray(
+            [c[3] for c in chords], dtype="<U8"
+        ) if chords else np.zeros(0, dtype="<U8"),
+        beats=np.asarray(list(beat_times), dtype=np.float64),
+        tempo=np.asarray([float(tempo)], dtype=np.float64),
+    )
+
+
+def _load_chords_npz(path):
+    cached = np.load(path, allow_pickle=False)
+    try:
+        chords = [
+            (float(s), float(e), int(r), str(q))
+            for s, e, r, q in zip(
+                cached["start"],
+                cached["end"],
+                cached["root"],
+                cached["quality"],
+            )
+        ]
+        beats = np.asarray(cached["beats"], dtype=np.float64)
+        tempo = float(np.asarray(cached["tempo"], dtype=np.float64).ravel()[0])
+        return chords, beats, tempo
+    finally:
+        cached.close()
+
+
+def _cached_analyze_chords(y_other, sr, y_harm, chord_analysis, cache_key):
+    """和弦/節拍分析 + 持久化快取（key 已含全部相關參數）。"""
+    if not cache_key:
+        return analyze_chords(
+            y_other, sr, y_harm=y_harm, chord_analysis=chord_analysis
+        )
+    path = os.path.join(_ensure_cache_dir("chords"), cache_key + ".npz")
+    if os.path.isfile(path):
+        print("  和弦/節拍 → 使用持久化快取（跳過 chroma/beat 分析）")
+        return _load_chords_npz(path)
+    result = analyze_chords(
+        y_other, sr, y_harm=y_harm, chord_analysis=chord_analysis
+    )
+    _save_chords_npz(path, *result)
+    return result
+
+
+def _save_drums_npz(
+    path, onset_times, onset_env, env_times, beat_times, tempo
+):
+    np.savez_compressed(
+        path,
+        onsets=np.asarray(list(onset_times), dtype=np.float64),
+        env=np.asarray(list(onset_env), dtype=np.float32),
+        env_times=np.asarray(list(env_times), dtype=np.float64),
+        beats=np.asarray(list(beat_times), dtype=np.float64),
+        tempo=np.asarray([float(tempo)], dtype=np.float64),
+    )
+
+
+def _load_drums_npz(path):
+    cached = np.load(path, allow_pickle=False)
+    try:
+        return (
+            np.asarray(cached["onsets"], dtype=np.float64),
+            np.asarray(cached["env"], dtype=np.float64),
+            np.asarray(cached["env_times"], dtype=np.float64),
+            np.asarray(cached["beats"], dtype=np.float64),
+            float(np.asarray(cached["tempo"], dtype=np.float64).ravel()[0]),
+        )
+    finally:
+        cached.close()
+
+
+def _cached_analyze_drums(y_drums, sr, cache_key):
+    """Drums onset/beat 分析 + 持久化快取（key 已含全部相關參數）。"""
+    if not cache_key:
+        return analyze_drums(y_drums, sr)
+    path = os.path.join(_ensure_cache_dir("drums"), cache_key + ".npz")
+    if os.path.isfile(path):
+        print("  Drums → 使用持久化快取（跳過 onset/beat 分析）")
+        return _load_drums_npz(path)
+    result = analyze_drums(y_drums, sr)
+    _save_drums_npz(path, *result)
+    return result
 
 
 def extract_instrumental_melody(
@@ -5484,6 +7669,248 @@ def merge_melody_sources(vocal_notes, instrumental_notes):
             result.append((ins_start, ins_end, ins_pitch))
 
     result.sort(key=lambda x: (x[0], x[2]))
+    return result
+
+
+def _harmonic_octave_score(y, sr, t0, t1, midi, n_partials=6):
+    """對某個音高算諧波模板分數（0~1，越高越像音訊裡實際唱的音）。
+
+    取 note 起點後一小段做 rfft，把 f0、2f0、...、6f0 各 ±3% 頻帶的
+    能量加權求和。真正的音高會拿到全部 6 個 partial；次諧波（低八度）
+    只有偶數 partial，分數明顯較低。
+    """
+
+    if y is None or sr is None or len(y) == 0:
+        return 0.0
+
+    a = int(max(0.0, t0 - 0.02) * sr)
+    seg_dur = min(max(t1 - t0 + 0.05, 0.10), 0.40)
+    b = int(min(float(len(y)) / sr, t0 - 0.02 + seg_dur) * sr)
+
+    if b - a < 256:
+        return 0.0
+
+    seg = np.asarray(y[a:b], dtype=float) * np.hanning(b - a)
+    spec = np.abs(np.fft.rfft(seg))
+    freqs = np.fft.rfftfreq(b - a, 1.0 / sr)
+
+    f0 = 440.0 * (2.0 ** ((float(midi) - 69.0) / 12.0))
+
+    if f0 < 45.0 or f0 > 2500.0:
+        return 0.0
+
+    total = float(spec.sum()) + 1e-12
+    band_energy = []
+
+    for h in range(1, n_partials + 1):
+
+        f = f0 * h
+
+        if f > sr * 0.5 - 60.0:
+            break
+
+        m = (freqs >= f * 0.97) & (freqs <= f * 1.03)
+
+        band_energy.append(
+            float(spec[m].sum()) if m.any() else 0.0
+        )
+
+    if not band_energy:
+        return 0.0
+
+    score = sum(
+        e / (h ** 0.5)
+        for h, e in enumerate(band_energy, start=1)
+    )
+
+    return score / total
+
+
+def fold_melody_register(
+    notes,
+    y_vocal=None,
+    sr=None,
+    window=4,
+    dev_threshold=9.0,
+    max_octaves=2,
+    min_gain=1.6,
+):
+    """修正主唱八度錯誤（RMVPE 偶發的八度 / 次諧波 dive）。
+
+    先用前後文中位數找出「偏離局部音域基準 >= dev_threshold」的
+    可疑音；有給 vocals 音訊時，再用諧波模板分數在 ±max_octaves
+    個八度副本中選出音訊真正支持的那個（分數需 >= min_gain 倍
+    現值才換）——方法決定性，不會把真實的高音段落誤折下來。
+    沒給音訊時退回純中位數折返（較保守）。音高以外的資訊不動。
+    """
+
+    if len(notes) < 3:
+        return [(s, e, p) for s, e, p in notes]
+
+    starts = [float(s) for s, _e, _p in notes]
+    ends = [float(e) for _s, e, _p in notes]
+    pitches = [float(p) for _s, _e, p in notes]
+    n = len(pitches)
+
+    for _ in range(2):
+
+        changed = 0
+        new_pitches = list(pitches)
+
+        for i in range(n):
+
+            lo = max(0, i - window)
+            hi = min(n, i + window + 1)
+
+            ctx = [
+                pitches[j]
+                for j in range(lo, hi)
+                if j != i
+            ]
+
+            if len(ctx) < 2:
+                continue
+
+            ref = float(np.median(ctx))
+            dev = pitches[i] - ref
+
+            if abs(dev) < dev_threshold:
+                continue
+
+            # 極短碎片（<40ms）的追蹤音高本身不可靠，不折。
+            if ends[i] - starts[i] < 0.04:
+                continue
+
+            cur = pitches[i]
+            best = cur
+
+            if y_vocal is not None and sr is not None:
+
+                # 音訊諧波驗證：在八度副本中選分數最高的。
+                scores = []
+                for k in range(-max_octaves, max_octaves + 1):
+                    cand = cur + 12 * k
+                    if cand < 36 or cand > 96:
+                        continue
+                    scores.append((
+                        cand,
+                        _harmonic_octave_score(
+                            y_vocal, sr, starts[i], ends[i], cand
+                        ),
+                    ))
+
+                if scores:
+                    scores.sort(key=lambda x: -x[1])
+                    cand, cand_score = scores[0]
+                    cur_score = next(
+                        (s for c, s in scores if c == cur), 0.0
+                    )
+                    if (
+                        cand != cur
+                        and cand_score > 1e-5
+                        and cand_score >= cur_score * min_gain
+                    ):
+                        best = cand
+
+            else:
+
+                # 沒有音訊 → 純中位數折返（折後需落入基準 ±7）。
+                best_k = 0
+                best_gap = abs(dev)
+
+                for k in range(-max_octaves, max_octaves + 1):
+
+                    if k == 0:
+                        continue
+
+                    gap = abs(cur + 12 * k - ref)
+
+                    if gap < best_gap:
+                        best_gap = gap
+                        best_k = k
+
+                if best_k != 0 and best_gap < 7.0:
+                    best = cur + 12 * best_k
+
+            if best != cur:
+                new_pitches[i] = best
+                changed += 1
+
+        pitches = new_pitches
+
+        if changed == 0:
+            break
+
+    return [
+        (s, e, int(round(pitches[i])))
+        for i, (s, e, _p) in enumerate(notes)
+    ]
+
+
+def align_instrumental_register(
+    instrumental_notes,
+    vocal_notes,
+    max_octaves=3,
+    tol=7.0,
+    time_window=2.0,
+):
+    """把純音樂段補入的旋律音對齊到鄰近主唱的音域。
+
+    每個樂器音以時間 ±time_window 內的主唱音高中位數為基準；
+    附近沒有主唱時退回最近 4 個主唱音、再退回全曲主唱中位數。
+    在 ±max_octaves 個八度副本中選最接近基準的；需明顯改善
+    （落入基準 ±12 半音內）才移動。
+    """
+
+    if not instrumental_notes or not vocal_notes:
+        return list(instrumental_notes)
+
+    v_starts = np.asarray(
+        [float(s) for s, _e, _p in vocal_notes], dtype=float
+    )
+    v_pitches = np.asarray(
+        [float(p) for _s, _e, p in vocal_notes], dtype=float
+    )
+    global_ref = float(np.median(v_pitches))
+
+    result = []
+
+    for s, e, p in instrumental_notes:
+
+        s = float(s)
+        e = float(e)
+        p = int(round(p))
+
+        center = (s + e) / 2.0
+        mask = np.abs(v_starts - center) <= time_window
+
+        if int(mask.sum()) >= 2:
+            ref = float(np.median(v_pitches[mask]))
+        elif len(v_pitches) >= 4:
+            nearest = np.argsort(np.abs(v_starts - center))[:4]
+            ref = float(np.median(v_pitches[nearest]))
+        else:
+            ref = global_ref
+
+        best = p
+        best_gap = abs(p - ref)
+
+        for k in range(-max_octaves, max_octaves + 1):
+
+            if k == 0:
+                continue
+
+            gap = abs(p + 12 * k - ref)
+
+            if gap < best_gap:
+                best_gap = gap
+                best = p + 12 * k
+
+        if best != p and best_gap <= max(tol, 12.0):
+            result.append((s, e, int(round(best))))
+        else:
+            result.append((s, e, p))
+
     return result
 
 
