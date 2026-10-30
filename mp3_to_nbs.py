@@ -30,6 +30,7 @@ def _timed_print(*args, **kwargs):
 builtins.print = _timed_print
 
 import argparse
+import bisect
 import hashlib
 import io
 import multiprocessing
@@ -3161,6 +3162,9 @@ L_PIANO_BANDS = (12, 13, 14, 15)
 L_GUITAR_BANDS = (16, 17, 18, 19)
 PIANO_GUITAR_BAND_BOUNDS = (48, 60, 72)
 
+# 主唱加厚層（--melody-double）：與主唱同節奏、音量較小的第二音色。
+L_MELODY_DOUBLE = 20
+
 
 # NBS 原版 16 種樂器（v5 格式；16 以上為 custom instruments）。
 # harp 與 piano 同為 0 號（Air），hat 與 click 同為 4 號（Glass）。
@@ -3263,7 +3267,272 @@ LAYER_NAMES = {
     L_GUITAR_BANDS[1]: "Guitar Mid-Low",
     L_GUITAR_BANDS[2]: "Guitar Mid-High",
     L_GUITAR_BANDS[3]: "Guitar High",
+    L_MELODY_DOUBLE: "Melody Double",
 }
+
+
+# ============================================================
+# 音域適配（range fit）
+# ============================================================
+# NBS 的 key 是「相對於樂器」的：key 33~57 是遊戲內的 2 個八度，
+# 但各樂器實際發出的音高 = harp 音高 + 八度偏移
+# （Minecraft wiki 音域表）：
+#   bass / didgeridoo      F#1-F#3  (-2 八度)
+#   guitar                 F#2-F#4  (-1)
+#   harp / pling / bit / banjo / iron xylophone  F#3-F#5  (0)
+#   flute / cow bell       F#4-F#6  (+1)
+#   bell / chime / xylophone  F#5-F#7  (+2)
+# 舊版所有樂器都用 key = midi - 21：harp 剛好正確，但 bass 會低兩個
+# 八度（E2 實際發出 E0，約 20Hz，幾乎聽不到）、guitar 低一個八度、
+# flute 高一個八度；而且 key 常跑出 33~57，超出範圍的音在樣本被
+# 拉伸過頭，音質變差、也無法在遊戲內播放。
+INSTR_OCTAVE = {
+    0: 0,    # harp / piano
+    1: -2,   # bass
+    5: -1,   # guitar
+    6: 1,    # flute
+    7: 2,    # bell
+    8: 2,    # chime
+    9: 2,    # xylophone
+    10: 0,   # iron xylophone
+    11: 1,   # cow bell
+    12: -2,  # didgeridoo
+    13: 0,   # bit
+    14: 0,   # banjo
+    15: 0,   # pling
+}
+NBS_WINDOW_LO = 33
+NBS_WINDOW_HI = 57
+
+
+def best_octave_shift(pitches, instrument_id, max_shift=4):
+    """替一個聲部選整體八度偏移，讓最多音符落在樂器的 2 八度範圍內。
+
+    只用「整個八度」平移，所以音名（和聲關係）不會變；數量差距不到
+    2% 時偏好較小的位移（盡量保持原音高）。
+    """
+    if not pitches:
+        return 0
+
+    off = INSTR_OCTAVE.get(int(instrument_id), 0)
+    base = np.asarray(
+        [int(round(p)) for p in pitches], dtype=np.int32
+    ) - 21 - 12 * off
+    margin = max(1, int(len(base) * 0.02))
+
+    def inside(t):
+        k = base + 12 * t
+        return int(
+            np.count_nonzero((k >= NBS_WINDOW_LO) & (k <= NBS_WINDOW_HI))
+        )
+
+    best_t = 0
+    best_c = inside(0)
+    for t in sorted(range(-max_shift, max_shift + 1), key=lambda x: (abs(x), x)):
+        if t == 0:
+            continue
+        c = inside(t)
+        if c > best_c + margin:
+            best_t, best_c = t, c
+    return best_t
+
+
+def fit_key(pitch, instrument_id, octave_shift=0):
+    """MIDI 音高 → 該樂器的 NBS key（已折進 33~57）。回傳 (key, 是否被折疊)。"""
+    off = INSTR_OCTAVE.get(int(instrument_id), 0)
+    key = int(round(pitch)) - 21 - 12 * off + 12 * int(octave_shift)
+    folded = False
+    while key < NBS_WINDOW_LO:
+        key += 12
+        folded = True
+    while key > NBS_WINDOW_HI:
+        key -= 12
+        folded = True
+    return key, folded
+
+
+# 主唱加厚：(樂器, 相對主唱的音高差(半音), 音量比例)
+# low  = 低八度的 harp（厚度、溫暖）；high = 高八度的 bell（亮度、空氣感）
+MELODY_DOUBLE_SPECS = {
+    "low": ("harp", -12, 0.50),
+    "high": ("bell", 12, 0.30),
+}
+
+
+# ============================================================
+# 和弦伴奏優化（--chord-polish / --chord-pattern）
+# ============================================================
+# 和弦偵測用 chroma 模板比對，常把普通三和弦誤判成 sus2 / sus4 / 七和弦，
+# 又每一拍都用同一個排列重敲，聽起來就是「一直重複、而且不搭」的 harp。
+# 這裡做四件事：
+#   1. 估計調性，把 sus / 七和弦改成「調內三和弦」（do-mi-sol 這類）
+#   2. 用 voice leading 選轉位：相鄰和弦的音盡量只動一小步
+#   3. 避開和旋律差半音的和弦音（最刺耳的衝突）
+#   4. 敲法：beat=每拍（舊）、bar=換和弦時敲、之後每 4 拍補敲、
+#      arp=每拍一個音，do-mi-sol-mi 琶音
+_KS_MAJOR = (6.35, 2.23, 3.48, 2.33, 4.38, 4.09,
+              2.52, 5.19, 2.39, 3.66, 2.29, 2.88)
+_KS_MINOR = (6.33, 2.68, 3.52, 5.38, 2.60, 3.53,
+              2.54, 4.75, 3.98, 2.69, 3.34, 3.17)
+_MAJOR_SCALE = (0, 2, 4, 5, 7, 9, 11)
+CHORD_INTERVALS = {
+    "maj": (0, 4, 7),
+    "min": (0, 3, 7),
+    "7": (0, 4, 7, 10),
+    "maj7": (0, 4, 7, 11),
+    "min7": (0, 3, 7, 10),
+    "sus2": (0, 2, 7),
+    "sus4": (0, 5, 7),
+    "dim": (0, 3, 6),
+}
+CHORD_ARP_PATTERN = (0, 1, 2, 1)   # do-mi-sol-mi
+CHORD_RESTRIKE_BEATS = 4           # bar 模式：每幾拍補敲一次
+CHORD_VOICE_RANGE = (55, 74)       # 和弦音的聲音範圍（MIDI）
+
+
+_MIDI_NAMES_PC = ("C", "C#", "D", "D#", "E", "F",
+                  "F#", "G", "G#", "A", "A#", "B")
+
+
+def estimate_scale(melody_notes, bass_notes, chords):
+    """Krumhansl-Schmuckler 估計調性。回傳 (tonic, mode, 七個音階音的集合)。"""
+    hist = np.zeros(12)
+    for n in melody_notes:
+        hist[int(round(n[2])) % 12] += max(float(n[1]) - float(n[0]), 0.05)
+    for n in bass_notes:
+        hist[int(round(n[2])) % 12] += 0.7 * max(float(n[1]) - float(n[0]), 0.05)
+    for (cs, ce, root, _q) in chords:
+        hist[int(root) % 12] += 0.5 * max(float(ce) - float(cs), 0.0)
+    if hist.sum() <= 0:
+        return None
+
+    best = None
+    for tonic in range(12):
+        for mode, prof in (("major", _KS_MAJOR), ("minor", _KS_MINOR)):
+            c = float(np.corrcoef(hist, np.roll(prof, tonic))[0, 1])
+            if c != c:  # NaN
+                continue
+            if best is None or c > best[0]:
+                best = (c, tonic, mode)
+    if best is None:
+        return None
+
+    _c, tonic, mode = best
+    major_tonic = tonic if mode == "major" else (tonic + 3) % 12
+    scale = frozenset((major_tonic + d) % 12 for d in _MAJOR_SCALE)
+    return tonic, mode, scale
+
+
+def snap_chord(root, quality, scale):
+    """把偵測到的和弦改成三和弦。回傳 (音程, 是否改動)。
+
+    根音在調內 → 取調內三和弦（do-mi-sol）；
+    根音在調外 → 保留根音，由偵測到的 3 度決定大/小。
+    """
+    root = int(root) % 12
+    detected = CHORD_INTERVALS.get(quality, (0, 4, 7))
+    if scale is not None and root in scale:
+        third = 4 if (root + 4) % 12 in scale else 3
+        fifth = 7 if (root + 7) % 12 in scale else 6
+    else:
+        third = 3 if (3 in detected) else 4
+        fifth = 6 if quality == "dim" else 7
+    iv = (0, third, fifth)
+    return iv, iv != tuple(detected)
+
+
+_TRIAD_NAME = {(0, 4, 7): "maj", (0, 3, 7): "min", (0, 3, 6): "dim"}
+
+
+def polish_chords(chords, melody_notes, bass_notes, verbose=True):
+    """整份和弦清單：sus / 七和弦 → 調內三和弦，並合併相鄰的相同和弦。
+
+    放在和弦偵測與修正之後、被 Other 和弦伴奏與 NBS 和弦層使用之前，
+    兩邊就會吃到同一份乾淨的和弦。
+    """
+    if not chords:
+        return chords
+    info = estimate_scale(melody_notes, bass_notes, chords)
+    scale = info[2] if info else None
+
+    def _share(items, names):
+        total = sum(max(float(e) - float(s), 0.0) for s, e, _r, _q in items)
+        part = sum(
+            max(float(e) - float(s), 0.0)
+            for s, e, _r, q in items if q in names
+        )
+        return part / total * 100 if total > 0 else 0.0
+
+    before = _share(chords, ("sus2", "sus4", "7", "maj7", "min7"))
+
+    out = []
+    for (s, e, root, quality) in chords:
+        iv, _changed = snap_chord(root, quality, scale)
+        q = _TRIAD_NAME.get(tuple(iv), "maj")
+        if out and out[-1][2] == root and out[-1][3] == q \
+                and float(s) - float(out[-1][1]) < 0.08:
+            out[-1] = (out[-1][0], e, root, q)
+        else:
+            out.append((s, e, root, q))
+
+    if verbose:
+        key_txt = (
+            f"{_MIDI_NAMES_PC[info[0]]} {info[1]}" if info else "未知"
+        )
+        print(
+            f"  和弦優化：調性 {key_txt}；sus/七和弦占 "
+            f"{before:.0f}% → 0%，{len(chords)} 段 → {len(out)} 段"
+        )
+    return out
+
+
+def _close_voicings(pcs, lo, hi):
+    """所有『緊密排列』的轉位 × 八度候選（升冪 MIDI list）。"""
+    out = []
+    n = len(pcs)
+    for inv in range(n):
+        order = pcs[inv:] + pcs[:inv]
+        for base in range(lo, hi + 1):
+            if base % 12 != order[0] % 12:
+                continue
+            notes = [base]
+            for pc in order[1:]:
+                p = notes[-1] + 1
+                while p % 12 != pc % 12:
+                    p += 1
+                notes.append(p)
+            if notes[-1] <= hi:
+                out.append(notes)
+    return out
+
+
+def choose_voicing(pcs, prev, lo=CHORD_VOICE_RANGE[0],
+                   hi=CHORD_VOICE_RANGE[1], center=64.0):
+    """選轉位：和前一個和弦的音距最小（voice leading），略偏好原位。"""
+    cands = _close_voicings(list(pcs), lo, hi)
+    if not cands:
+        base = 60 + (pcs[0] % 12)
+        return [base + ((pc - pcs[0]) % 12) for pc in pcs]
+
+    def cost(v):
+        c = 0.15 * abs(float(np.mean(v)) - center)
+        if v[0] % 12 != pcs[0] % 12:
+            c += 0.6
+        if prev is not None:
+            a = np.sort(np.asarray(v, dtype=float))
+            b = np.sort(np.asarray(prev, dtype=float))
+            if len(a) == len(b):
+                c += float(np.abs(a - b).sum())
+            else:
+                c += abs(float(a.mean()) - float(b.mean())) * len(a)
+        return c
+
+    return list(min(cands, key=cost))
+
+
+def _semitone_clash(chord_pc, melody_pc):
+    d = (int(chord_pc) - int(melody_pc)) % 12
+    return d == 1 or d == 11
 
 
 def _clip(
@@ -3539,6 +3808,13 @@ def build_nbs_bytes(
     layer_panning=None,
     piano_notes=None,
     guitar_notes=None,
+    range_fit=False,
+    melody_double="off",
+    octave_bias=None,
+    trim_silence=False,
+    trim_edge_gap=0.0,
+    chord_pattern="beat",
+    chord_polish=False,
 ):
 
     # 音色映射（preset + override 已在 main 解析）。
@@ -3626,10 +3902,65 @@ def build_nbs_bytes(
         )
 
     # ========================================================
+    # 音域適配（range_fit）
+    #
+    # range_fit=False 時 key_of() 等同舊的 midi_to_nbs_key()，
+    # 輸出與舊版 byte 完全相同（legacy preset 走這條）。
+    # range_fit=True 時：依樂器八度補償 → 每個聲部選一個整體八度偏移
+    # → 剩下超出 33~57 的個別音符以八度折回。
+    # octave_bias 是使用者用 --*-octave-shift 手動指定的偏移：
+    # 先扣掉再規劃、規劃完再加回，確保手動設定不會被自動適配吃掉。
+    # ========================================================
+
+    octave_bias = octave_bias or {}
+    fit_shift = {}
+    fit_stats = {}
+
+    def plan_fit(group, instrument, pitches, bias=0):
+        if not range_fit or not pitches:
+            return
+        raw = [int(round(p)) - 12 * int(bias) for p in pitches]
+        fit_shift[(group, instrument)] = (
+            best_octave_shift(raw, instrument) + int(bias)
+        )
+
+    def key_of(pitch, instrument, group):
+        if not range_fit:
+            return midi_to_nbs_key(pitch)
+        key, folded = fit_key(
+            pitch,
+            instrument,
+            fit_shift.get((group, instrument), 0),
+        )
+        st = fit_stats.setdefault(group, [0, 0])
+        st[1] += 1
+        if folded:
+            st[0] += 1
+        return key
+
+    # ========================================================
     # 主唱
     # ========================================================
 
     melody_instrument = inst_map["melody"]
+
+    def melody_inst_id(pitch):
+        if melody_instrument == "auto":
+            return (
+                INSTR["bell"]
+                if midi_to_nbs_key(pitch) >= 55
+                else INSTR["flute"]
+            )
+        return INSTR[melody_instrument]
+
+    if range_fit:
+        _g = {}
+        for note in melody_notes:
+            _g.setdefault(melody_inst_id(note[2]), []).append(note[2])
+        for _inst, _p in _g.items():
+            plan_fit(
+                "Melody", _inst, _p, octave_bias.get("melody", 0)
+            )
 
     for note in melody_notes:
 
@@ -3661,20 +3992,15 @@ def build_nbs_bytes(
                 else 92
             )
 
-        key = midi_to_nbs_key(
-            pitch
-        )
+        # auto：依音域自動選，高音域用 bell（glockenspiel）增加亮度，
+        # 其餘維持 flute。（判斷用原始 key，與舊版一致）
+        instrument = melody_inst_id(pitch)
 
-        if melody_instrument == "auto":
-            # 依音域自動選：高音域用 bell（glockenspiel）增加亮度，
-            # 其餘維持 flute。
-            instrument = (
-                INSTR["bell"]
-                if key >= 55
-                else INSTR["flute"]
-            )
-        else:
-            instrument = INSTR[melody_instrument]
+        key = key_of(
+            pitch,
+            instrument,
+            "Melody",
+        )
 
         add_note(
             L_MELODY,
@@ -3684,9 +4010,41 @@ def build_nbs_bytes(
             velocity,
         )
 
+        # 主唱加厚：同 tick、較小音量的第二音色。
+        # 兩個樂器的八度偏移已換算，音高差固定 ±12 半音。
+        if melody_double in MELODY_DOUBLE_SPECS:
+            d_name, d_semi, d_scale = MELODY_DOUBLE_SPECS[melody_double]
+            d_inst = INSTR[d_name]
+            d_key = (
+                key
+                + 12 * (INSTR_OCTAVE.get(instrument, 0)
+                        - INSTR_OCTAVE.get(d_inst, 0))
+                + d_semi
+            )
+            if range_fit:
+                while d_key < NBS_WINDOW_LO:
+                    d_key += 12
+                while d_key > NBS_WINDOW_HI:
+                    d_key -= 12
+            add_note(
+                L_MELODY_DOUBLE,
+                tick,
+                d_inst,
+                d_key,
+                _clip(velocity * d_scale, 6, 100),
+                collision_mode="drop",
+            )
+
     # ========================================================
     # Bass
     # ========================================================
+
+    plan_fit(
+        "Bass",
+        INSTR[inst_map["bass"]],
+        [n[2] for n in bass_notes],
+        octave_bias.get("bass", 0),
+    )
 
     for note in bass_notes:
 
@@ -3722,8 +4080,10 @@ def build_nbs_bytes(
             L_BASS,
             tick,
             INSTR[inst_map["bass"]],
-            midi_to_nbs_key(
-                pitch
+            key_of(
+                pitch,
+                INSTR[inst_map["bass"]],
+                "Bass",
             ),
             velocity,
         )
@@ -3737,6 +4097,23 @@ def build_nbs_bytes(
     # 這只是聲部分群，不是樂器分類；目的是讓同一個 tick 能同時
     # 容納不同音域的 Other 音符，並讓 NBS 播放時不全部擠成一條線。
     # ========================================================
+
+    if range_fit and other_notes:
+        _g = {}
+        for note in other_notes:
+            _g.setdefault(
+                classify_other_layer(note[2], note[1] - note[0]), []
+            ).append(note[2])
+        for _layer, _p in _g.items():
+            if _layer == L_OTHER_LOW:
+                _inst = INSTR[inst_map["other_low"]]
+            elif _layer == L_OTHER_HIGH:
+                _inst = INSTR[inst_map["other_high"]]
+            else:
+                _inst = INSTR[inst_map["other_mid"]]
+            plan_fit(
+                _layer, _inst, _p, octave_bias.get("other", 0)
+            )
 
     for note in other_notes:
 
@@ -3769,9 +4146,7 @@ def build_nbs_bytes(
         ):
             continue
 
-        key = midi_to_nbs_key(
-            pitch
-        )
+        # key 要等樂器決定後才能算（見下方 other_instrument）。
 
         # NBS 沒有 MIDI 式 note-off / duration。
         # 舊版無論音符多短都每 0.25 秒重敲，長音很容易變成「叮、叮、叮」。
@@ -3824,7 +4199,7 @@ def build_nbs_bytes(
                 other_layer,
                 tick,
                 other_instrument,
-                key,
+                key_of(pitch, other_instrument, other_layer),
                 velocity,
                 collision_mode="replace_weaker",
             )
@@ -3832,6 +4207,100 @@ def build_nbs_bytes(
     # ========================================================
     # 和弦
     # ========================================================
+
+    # 和弦音固定落在 C4~A5 附近：用均勻音高分佈規劃八度偏移即可。
+    _chord_new = chord_polish or chord_pattern != "beat"
+    plan_fit(
+        "Chord",
+        INSTR[inst_map["chord"]],
+        list(range(CHORD_VOICE_RANGE[0], CHORD_VOICE_RANGE[1] + 1))
+        if _chord_new
+        else list(range(60, 83)),
+    )
+
+    # ---- 新版和弦伴奏（chord_polish / chord_pattern != beat）----
+    chord_scale = None
+    if chord_polish and chords:
+        chord_scale = estimate_scale(melody_notes, bass_notes, chords)
+        if chord_scale is not None:
+            _t, _m, _sc = chord_scale
+            print(
+                f"  和弦：推測調性 {_MIDI_NAMES_PC[_t]} {_m}"
+            )
+
+    _mel_sorted = sorted(
+        (float(n[0]), float(n[1]), int(round(n[2])) % 12)
+        for n in melody_notes
+    )
+    _mel_starts = [m[0] for m in _mel_sorted]
+    chord_stats = {"beats": 0, "strikes": 0, "snapped": 0, "clash": 0}
+    chord_state = {"key": None, "k": 0, "voicing": None}
+
+    def melody_pc_at(t):
+        i = bisect.bisect_right(_mel_starts, t + 0.04) - 1
+        if i >= 0 and _mel_sorted[i][1] > t - 0.02:
+            return _mel_sorted[i][2]
+        return None
+
+    def emit_new_chord(beat, tick, root, quality):
+        chord_stats["beats"] += 1
+        if chord_polish:
+            iv, changed = snap_chord(
+                root, quality,
+                chord_scale[2] if chord_scale else None,
+            )
+        else:
+            iv = CHORD_INTERVALS.get(quality, (0, 4, 7))
+            changed = False
+        key = (int(root) % 12, tuple(iv))
+        if key != chord_state["key"]:
+            chord_state["key"] = key
+            chord_state["k"] = 0
+            pcs = [(int(root) + i) % 12 for i in iv]
+            if chord_polish:
+                chord_state["voicing"] = choose_voicing(
+                    pcs, chord_state["voicing"]
+                )
+            else:
+                chord_state["voicing"] = [60 + int(root) + i for i in iv]
+            if changed:
+                chord_stats["snapped"] += 1
+        else:
+            chord_state["k"] += 1
+
+        k = chord_state["k"]
+        voicing = chord_state["voicing"]
+        layers = (L_CH_ROOT, L_CH_3RD, L_CH_5TH, L_CH_7TH)
+        inst = INSTR[inst_map["chord"]]
+        m_pc = melody_pc_at(beat) if chord_polish else None
+
+        if chord_pattern == "arp":
+            idx = CHORD_ARP_PATTERN[k % len(CHORD_ARP_PATTERN)]
+            idx = min(idx, len(voicing) - 1)
+            picks = [(idx, voicing[idx])]
+            vel = 46 if k % 4 == 0 else 36
+        elif chord_pattern == "bar":
+            if k % CHORD_RESTRIKE_BEATS != 0:
+                return
+            picks = list(enumerate(voicing))
+            vel = 48 if k == 0 else 40
+        else:  # beat
+            picks = list(enumerate(voicing))
+            vel = 42
+
+        for idx, pitch in picks:
+            if m_pc is not None and _semitone_clash(pitch % 12, m_pc):
+                chord_stats["clash"] += 1
+                continue
+            chord_stats["strikes"] += 1
+            add_note(
+                layers[min(idx, 3)],
+                tick,
+                inst,
+                key_of(pitch, inst, "Chord"),
+                vel,
+                collision_mode="drop",
+            )
 
     for beat in beat_times:
 
@@ -3872,8 +4341,10 @@ def build_nbs_bytes(
                         L_BASS,
                         tick,
                         INSTR[inst_map["bass"]],
-                        midi_to_nbs_key(
-                            bass_midi
+                        key_of(
+                            bass_midi,
+                            INSTR[inst_map["bass"]],
+                            "Bass",
                         ),
                         52,
                         collision_mode="shift",
@@ -3882,6 +4353,10 @@ def build_nbs_bytes(
                 # ------------------------------------------------
                 # 和弦
                 # ------------------------------------------------
+
+                if _chord_new:
+                    emit_new_chord(beat, tick, root, quality)
+                    break
 
                 chord_intervals = {
                     "maj": (0, 4, 7),
@@ -3920,8 +4395,10 @@ def build_nbs_bytes(
                         layer,
                         tick,
                         INSTR[inst_map["chord"]],
-                        midi_to_nbs_key(
-                            chord_midi
+                        key_of(
+                            chord_midi,
+                            INSTR[inst_map["chord"]],
+                            "Chord",
                         ),
                         42,
                         collision_mode="drop",
@@ -3977,6 +4454,20 @@ def build_nbs_bytes(
         if not source_notes:
             continue
 
+        if range_fit:
+            _g = {}
+            for note in source_notes:
+                _g.setdefault(
+                    band_layers[piano_guitar_band_index(note[2])], []
+                ).append(note[2])
+            for _layer, _p in _g.items():
+                plan_fit(
+                    _layer,
+                    INSTR[inst_map[inst_key]],
+                    _p,
+                    octave_bias.get("other", 0),
+                )
+
         for note in source_notes:
 
             start = note[0]
@@ -4015,8 +4506,10 @@ def build_nbs_bytes(
                 layer,
                 start_tick,
                 INSTR[inst_map[inst_key]],
-                midi_to_nbs_key(
-                    pitch
+                key_of(
+                    pitch,
+                    INSTR[inst_map[inst_key]],
+                    layer,
                 ),
                 velocity,
                 collision_mode="replace_weaker",
@@ -4045,15 +4538,57 @@ def build_nbs_bytes(
         tick_map.keys()
     )
 
+    # ========================================================
+    # 剃除前後空白（trim_silence）
+    #
+    # 第一個音平移到 tick 0；結尾以最後一個音為準（不再保留
+    # 原始音訊的尾端靜音）。trim_edge_gap > 0 時，頭尾與主體
+    # 相隔超過這麼多秒的孤立音視為雜音，一併移除。
+    # ========================================================
+
+    trim_report = None
+    if trim_silence and all_ticks:
+        keep = all_ticks
+        if trim_edge_gap and trim_edge_gap > 0:
+            limit = float(trim_edge_gap) * tps
+            lo, hi = 0, len(keep) - 1
+            while hi > lo and keep[hi] - keep[hi - 1] > limit:
+                hi -= 1
+            while lo < hi and keep[lo + 1] - keep[lo] > limit:
+                lo += 1
+            keep = keep[lo:hi + 1]
+
+        first_tick = keep[0]
+        trim_report = {
+            "lead_ticks": first_tick,
+            "dropped_ticks": len(all_ticks) - len(keep),
+            "orig_last": all_ticks[-1],
+        }
+        tick_map = {t - first_tick: tick_map[t] for t in keep}
+        all_ticks = sorted(tick_map.keys())
+
     # 有原始音訊長度時保留整首歌曲的尾端靜音，不讓 NBS 提前結束。
+    # （開啟 trim_silence 時改以最後一個音為準。）
     audio_length_tick = 0
-    if song_duration is not None:
+    if song_duration is not None and not trim_silence:
         audio_length_tick = max(0, int(round(float(song_duration) * tps)))
 
     song_length = max(
         all_ticks[-1] if all_ticks else 0,
         audio_length_tick,
     )
+
+    if trim_report is not None:
+        print(
+            f"  裁剪空白：開頭 {trim_report['lead_ticks']} tick "
+            f"({trim_report['lead_ticks'] / tps:.2f}s)"
+            + (
+                f"，移除頭尾孤立音 {trim_report['dropped_ticks']} 個 tick"
+                if trim_report["dropped_ticks"]
+                else ""
+            )
+            + f"；新長度 {song_length} tick ({song_length / tps:.1f}s)"
+        )
 
     # ========================================================
     # Binary
@@ -4242,6 +4777,23 @@ def build_nbs_bytes(
         )
 
     w_u8(0)
+
+    if _chord_new and chord_stats["beats"]:
+        print(
+            f"  和弦伴奏：{chord_stats['beats']} 拍 → 敲 "
+            f"{chord_stats['strikes']} 個音"
+            + (f"；{chord_stats['snapped']} 段改成調內三和弦"
+               if chord_polish else "")
+            + (f"；避開與旋律衝突的和弦音 {chord_stats['clash']} 個"
+               if chord_polish else "")
+        )
+
+    if range_fit and fit_stats:
+        for group, (folded, total) in fit_stats.items():
+            name = LAYER_NAMES.get(group, str(group))
+            print(
+                f"  音域適配 {name}：折疊 {folded}/{total} 個音符"
+            )
 
     print(
         f"產生 "
@@ -4818,6 +5370,36 @@ def main():
         ),
     )
 
+    melody_group.add_argument(
+        "--vocal-register-fit",
+        choices=("auto", "off"),
+        default=None,
+        help=(
+            "主唱音域自動歸位：整體偏高／偏低時自動調到剛剛好的"
+            "八度（NBS 舒適音域 key 33~57）；歌裡同時有男聲＋女聲"
+            "時，先依 vocals 音訊驗證整段短語的八度，再讓兩個聲部"
+            "分別歸位、維持高低分離，不會被擠成同一個八度。"
+            "只動整個八度，不改音高內容。"
+            "未指定時依 preset：legacy=off、其餘=auto。"
+            "--melody-octave-shift 是手動整體升降，會與此功能疊加。"
+        ),
+    )
+
+    melody_group.add_argument(
+        "--chord-melody-fit",
+        choices=("auto", "off"),
+        default=None,
+        help=(
+            "和弦配對檢查：和弦偵測只看 Other stem 的 chroma"
+            "（人聲與 Bass 已被分離抽走，根音證據薄弱），容易抓到"
+            "錯根音／7 和弦／sus，讓和弦伴奏（harp）在拍上彈出"
+            "不搭主旋律的神祕音。開啟後用主旋律（和弦音覆蓋率）"
+            "與 Bass（根音證據）重新檢查每個和弦段，只在明顯更好"
+            "時才修正，並移除孤立的單拍怪和弦。"
+            "未指定時依 preset：legacy=off、其餘=auto。"
+        ),
+    )
+
     # ========================================================
     # Bass pYIN 參數
     # ========================================================
@@ -5332,6 +5914,73 @@ def main():
         ),
     )
 
+    nbs_group.add_argument(
+        "--range-fit",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "音域適配：依各樂器的八度偏移換算 key，並把音符折進"
+            "遊戲內 2 個八度（key 33~57）。修正 Bass 低兩個八度、"
+            "Guitar 低一個八度、Flute 高一個八度等問題。"
+            "未指定時依 preset：legacy=off、其餘=on"
+        ),
+    )
+
+    nbs_group.add_argument(
+        "--melody-double",
+        choices=("off", "low", "high"),
+        default="off",
+        help=(
+            "主唱加厚：另開一層較小音量的第二音色。"
+            "low=低八度 harp（厚、暖）；high=高八度 bell（亮、有空氣感）"
+            "（預設: %(default)s）"
+        ),
+    )
+
+    nbs_group.add_argument(
+        "--trim-silence",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "剃除前後空白：第一個音移到 tick 0，結尾以最後一個音為準。"
+            "未指定時依 preset：legacy=off、其餘=on"
+        ),
+    )
+
+    nbs_group.add_argument(
+        "--trim-edge-gap",
+        type=float,
+        default=0.0,
+        metavar="秒",
+        help=(
+            "裁剪時，頭尾與主體相隔超過這麼多秒的孤立音視為雜音並移除"
+            "（預設 0=不移除；建議 5）"
+        ),
+    )
+
+    nbs_group.add_argument(
+        "--chord-polish",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "和弦優化：推測調性，把 sus / 七和弦改成調內三和弦（do-mi-sol），"
+            "用 voice leading 選轉位，並避開與旋律差半音的和弦音。"
+            "未指定時依 preset：legacy=off、其餘=on"
+        ),
+    )
+
+    nbs_group.add_argument(
+        "--chord-pattern",
+        choices=("beat", "bar", "arp"),
+        default=None,
+        help=(
+            "和弦伴奏敲法：beat=每拍都敲（舊行為）；"
+            "bar=換和弦時敲、之後每 4 拍補敲；"
+            "arp=每拍一個音的琶音（do-mi-sol-mi）。"
+            "未指定時依 preset：legacy=beat、其餘=bar"
+        ),
+    )
+
     args = ap.parse_args()
 
     # 命令列是否出現過某個選項（給 preset 判斷「使用者是否明確指定」）。
@@ -5396,6 +6045,59 @@ def main():
     print(
         f"動態力度：{args.dynamics}"
         f"，立體聲 panning：{args.panning}"
+    )
+
+    # 主唱音域自動歸位：未指定時 legacy=off（舊行為、輸出
+    # byte 不變），其餘 preset=on；--vocal-register-fit auto
+    # 強制開啟、off 強制關閉。
+    if args.vocal_register_fit is None:
+        args.vocal_register_fit = (
+            args.instrument_preset != "legacy"
+        )
+    else:
+        args.vocal_register_fit = (
+            args.vocal_register_fit != "off"
+        )
+
+    print(
+        "主唱音域自動歸位："
+        + ("開啟" if args.vocal_register_fit else "關閉")
+    )
+
+    # 和弦配對檢查：未指定時 legacy=off（舊行為、輸出
+    # byte 不變），其餘 preset=on；auto 強制開啟、off 強制關閉。
+    if args.chord_melody_fit is None:
+        args.chord_melody_fit = (
+            args.instrument_preset != "legacy"
+        )
+    else:
+        args.chord_melody_fit = (
+            args.chord_melody_fit != "off"
+        )
+
+    print(
+        "和弦配對檢查："
+        + ("開啟" if args.chord_melody_fit else "關閉")
+    )
+
+    # 音域適配：legacy 關閉（舊輸出 byte 不變）、其餘 preset 開啟。
+    if args.range_fit is None:
+        args.range_fit = args.instrument_preset != "legacy"
+
+    if args.trim_silence is None:
+        args.trim_silence = args.instrument_preset != "legacy"
+
+    if args.chord_polish is None:
+        args.chord_polish = args.instrument_preset != "legacy"
+
+    if args.chord_pattern is None:
+        args.chord_pattern = (
+            "beat" if args.instrument_preset == "legacy" else "bar"
+        )
+
+    print(
+        f"音域適配：{'on' if args.range_fit else 'off'}"
+        f"，主唱加厚：{args.melody_double}"
     )
 
     # Piano/Guitar 級聯：未指定時 legacy 關閉、其餘 preset 開啟。
@@ -6134,6 +6836,25 @@ def main():
                 )
 
         # ------------------------------------------------
+        # 主唱音域自動歸位（--vocal-register-fit，預設開啟）：
+        # 有些歌整體轉出來偏高、有些偏低；還有些歌同時有
+        # 男聲跟女聲、兩個音域不同。這裡先用 vocals 音訊
+        # 驗證整段短語的八度（修 RMVPE 整段鎖錯八度），
+        # 再把音域歸位到 NBS 舒適音域；男聲＋女聲兩個聲部
+        # 各自歸位、維持高低分離。放在 fold 之後（先修
+        # 孤立 dive 再歸位），後面的純音樂對齊與孤立八度
+        # 校正都會接在正確的音域上。
+        # ------------------------------------------------
+
+        if args.vocal_register_fit and melody_notes:
+
+            melody_notes = auto_fit_vocal_register(
+                melody_notes,
+                y_vocal,
+                args.sr,
+            )
+
+        # ------------------------------------------------
         # 純音樂段旋律：先對齊到鄰近主唱音域，再合併；
         # 避免 merge 後在段落交界出現 2 個八度以上的大跌落
         # ------------------------------------------------
@@ -6186,6 +6907,28 @@ def main():
         # 但 chords = []，因此後續和弦伴奏 / Bass 聯動 / 八度校正
         # 都會自動跳過和弦相關分支。
         # ====================================================
+
+        # ------------------------------------------------
+        # 和弦配對檢查（--chord-melody-fit，預設開啟）：
+        # analyze_chords 只看 Other chroma，人聲與 Bass 證據被
+        # Demucs 分走了；這裡用主旋律 + Bass 重新檢查每個和弦段，
+        # 和弦伴奏（harp）才不會在拍上彈出不搭主旋律的神祕音。
+        # 放在八度校正之前，讓 correct_melody_octaves 與 Bass
+        # 聯動拿到修正後的和弦。
+        # ------------------------------------------------
+
+        if (
+            args.chord_melody_fit
+            and chords
+            and melody_notes
+        ):
+
+            chords = refine_chords_with_melody_bass(
+                chords,
+                melody_notes,
+                bass_notes,
+                beat_times=other_beat_times,
+            )
 
         # ------------------------------------------------
         # 修正主唱偶爾抓錯八度的孤立音
@@ -6472,6 +7215,11 @@ def main():
         # 若 --enable-chord-analysis 未啟用，hybrid/chord/mix
         # 都需要和弦資料，因此自動退化為 extract 模式，並印出警告。
         # ====================================================
+
+        # 和弦優化（--chord-polish）：sus / 七和弦改成調內三和弦。
+        # Other 的和弦補缺 / 和弦伴奏與 NBS 的和弦層都吃這份。
+        if args.chord_polish and chords:
+            chords = polish_chords(chords, melody_notes, bass_notes)
 
         # Phase E：去重複只作用在「O&F 實際抽取音」。
         # 和弦補缺 / 和弦伴奏（generate_chord_accompaniment）不與
@@ -6881,6 +7629,24 @@ def main():
             piano_notes=piano_notes,
 
             guitar_notes=guitar_notes,
+
+            range_fit=args.range_fit,
+
+            melody_double=args.melody_double,
+
+            octave_bias={
+                "melody": args.melody_octave_shift,
+                "bass": args.bass_octave_shift,
+                "other": args.other_octave_shift,
+            },
+
+            trim_silence=args.trim_silence,
+
+            trim_edge_gap=args.trim_edge_gap,
+
+            chord_pattern=args.chord_pattern,
+
+            chord_polish=args.chord_polish,
         )
 
         print(
@@ -7029,6 +7795,221 @@ def extract_bass_notes_pyin(y, sr, fmin_note="C2", fmax_note="C6",
         elif e - s >= min_dur:
             merged.append((s, e, p))
     print(f"{name}：提取 {len(merged)} 個音符")
+    return merged
+
+
+def refine_chords_with_melody_bass(
+    chords,
+    melody_notes,
+    bass_notes=None,
+    beat_times=None,
+    keep_bonus=0.12,
+    verbose=True,
+):
+    """和弦配對檢查：用主旋律 + Bass 重新檢查和弦偵測結果。
+
+    analyze_chords 只看 Other stem 的 chroma——Demucs 已把人聲與
+    Bass 分走，和弦根音最強的證據根本不在裡面；Other 稀疏時
+    chroma 被少數幾個音主導，容易抓到錯根音、7 和弦、sus，
+    和弦伴奏（harp）就會在拍上彈出一堆不搭主旋律的神祕音。
+
+    對每個和弦段重新評分：
+      * 主旋律音高類直方圖（時長加權）→ 和弦音覆蓋率（權重 1.6）
+      * Bass 音高類 → 根音 / 和弦音證據（權重 0.8）
+      * 常用三和弦先驗（maj / min 高、7 / sus 低、dim 最低）
+      * 7 / sus / dim 的特徵音若在主旋律與 Bass 都幾乎沒出現，
+        視為 chroma 誤判而扣分——那正是 harp 在拍上彈出的
+        「神祕音」來源。
+    現有和弦有 keep_bonus 的保守加分，新候選必須贏過
+    「原分 + keep_bonus」才會取代——沒有足夠證據不亂改。
+    另外把「與兩旁不同、長度不到一拍」的孤立怪和弦改成鄰居，
+    最後合併相鄰同和弦。和弦格式 (s, e, root, quality) 不變。
+    """
+
+    if not chords:
+        return list(chords)
+
+    quality_intervals = {
+        "maj": (0, 4, 7),
+        "min": (0, 3, 7),
+        "7": (0, 4, 7, 10),
+        "maj7": (0, 4, 7, 11),
+        "min7": (0, 3, 7, 10),
+        "sus2": (0, 2, 7),
+        "sus4": (0, 5, 7),
+        "dim": (0, 3, 6),
+    }
+    # 三和弦先驗：流行歌大多 maj / min；7 系與 sus 常是 chroma
+    # 模糊時的誤判；dim 在不明證據下最不可信。
+    quality_prior = {
+        "maj": 0.10, "min": 0.10,
+        "sus2": 0.05, "sus4": 0.05,
+        "7": 0.03, "maj7": 0.02, "min7": 0.02,
+        "dim": 0.0,
+    }
+
+    melody_notes = list(melody_notes or [])
+    bass_notes = list(bass_notes or [])
+
+    def _tone_mask(root, quality):
+        m = np.zeros(12, dtype=bool)
+        for iv in quality_intervals.get(quality, (0, 4, 7)):
+            m[(int(root) + iv) % 12] = True
+        return m
+
+    def _pc_weight(notes, s, e):
+        w = np.zeros(12)
+        for ns, ne, npitch in notes:
+            ov = min(float(ne), e) - max(float(ns), s)
+            if ov <= 0.0:
+                continue
+            w[int(round(float(npitch))) % 12] += ov
+        return w
+
+    def _melody_fit(w, root, quality):
+        tot = float(w.sum())
+        if tot <= 0.0:
+            return 0.5          # 無旋律證據 → 全候選中性
+        return float(w[_tone_mask(root, quality)].sum()) / tot
+
+    def _bass_fit(w, root, quality):
+        tot = float(w.sum())
+        if tot <= 0.0:
+            return 0.0          # 無 Bass 證據 → 不影響排名
+        root_w = float(w[int(root) % 12])
+        tone_w = float(w[_tone_mask(root, quality)].sum())
+        # 根音是最強證據，和弦音（3rd / 5th，轉位）為輔。
+        return 0.7 * (root_w / tot) + 0.3 * (tone_w / tot)
+
+    # 特徵音：非三和弦（0,4,7 / 0,3,7）品質的「多出來的那個音」。
+    extra_interval = {
+        "7": 10, "maj7": 11, "min7": 10,
+        "sus2": 2, "sus4": 5, "dim": 6,
+    }
+
+    def _score(w_m, w_b, root, quality):
+        sc = (
+            1.6 * _melody_fit(w_m, root, quality)
+            + 0.8 * _bass_fit(w_b, root, quality)
+            + quality_prior.get(quality, 0.02)
+        )
+
+        ei = extra_interval.get(quality)
+
+        if ei is not None:
+            tot = float(w_m.sum()) + float(w_b.sum())
+            if tot > 0.0:
+                pc = (int(root) + ei) % 12
+                support = float(w_m[pc]) + float(w_b[pc])
+                if support / tot < 0.05:
+                    sc -= 0.15
+
+        return sc
+
+    # 每拍長度：孤立短段判定用。
+    if beat_times is not None and len(beat_times) >= 2:
+        beat_len = float(
+            np.median(np.diff(np.asarray(beat_times, dtype=float)))
+        )
+    else:
+        durs = [float(e) - float(s) for s, e, _r, _q in chords]
+        beat_len = float(np.median(durs)) if durs else 0.5
+    beat_len = max(0.15, min(beat_len, 2.0))
+
+    refined = []
+    changes = []
+    n_smoothed = 0
+
+    for s, e, root, quality in chords:
+
+        s = float(s)
+        e = float(e)
+        root = int(root)
+        quality = str(quality)
+
+        w_m = _pc_weight(melody_notes, s, e)
+        w_b = _pc_weight(bass_notes, s, e)
+
+        base = _score(w_m, w_b, root, quality)
+
+        # 候選根音：旋律 / Bass 權重前幾名 + 原根音。
+        cand_roots = {root}
+        for w in (w_m, w_b):
+            if float(w.sum()) > 0.0:
+                for pc in np.argsort(w)[::-1][:3]:
+                    if w[pc] > 0.0:
+                        cand_roots.add(int(pc))
+
+        best_rq = (root, quality)
+        best_score = base
+
+        for cr in sorted(cand_roots):
+            for cq in quality_intervals:
+                if (cr, cq) == (root, quality):
+                    continue
+                sc = _score(w_m, w_b, cr, cq)
+                if sc > best_score:
+                    best_score = sc
+                    best_rq = (cr, cq)
+
+        # 新候選必須贏過「原和弦 + keep_bonus」：
+        # 證據不明顯時維持原判，避免把對的改錯。
+        if best_rq != (root, quality) and (
+            best_score > base + keep_bonus
+        ):
+            changes.append((s, (root, quality), best_rq))
+            root, quality = best_rq
+
+        refined.append((s, e, root, quality))
+
+    # 孤立怪和弦：與兩旁不同、兩旁彼此相同、長度 < 1 拍
+    # → 直接改成鄰居和弦（beat 級雜訊）。
+    smoothed = list(refined)
+
+    for i in range(1, len(smoothed) - 1):
+        s, e, r, q = smoothed[i]
+        prev_rq = smoothed[i - 1][2:]
+        next_rq = smoothed[i + 1][2:]
+        if (
+            float(e) - float(s) < beat_len * 1.05
+            and (r, q) != prev_rq
+            and prev_rq == next_rq
+        ):
+            smoothed[i] = (s, e, prev_rq[0], prev_rq[1])
+            n_smoothed += 1
+
+    # 相鄰同和弦合併（修正可能造成新的相鄰重複）。
+    merged = []
+
+    for c in smoothed:
+        if (
+            merged
+            and c[2:] == merged[-1][2:]
+            and float(c[0]) - float(merged[-1][1]) < 0.08
+        ):
+            merged[-1] = (
+                merged[-1][0], c[1], c[2], c[3]
+            )
+        else:
+            merged.append(c)
+
+    if verbose:
+
+        print(
+            f"  和弦配對檢查：修正 {len(changes)} 段、"
+            f"移除孤立怪和弦 {n_smoothed} 段"
+            f"（合併後 {len(merged)} 段）"
+        )
+
+        for s, old_rq, new_rq in changes[:6]:
+            print(
+                f"    {s:7.2f}s  "
+                f"{_MIDI_NAMES[old_rq[0] % 12]} {old_rq[1]} → "
+                f"{_MIDI_NAMES[new_rq[0] % 12]} {new_rq[1]}"
+            )
+        if len(changes) > 6:
+            print(f"    ... 等 {len(changes)} 段")
+
     return merged
 
 
@@ -7844,6 +8825,525 @@ def fold_melody_register(
     return [
         (s, e, int(round(pitches[i])))
         for i, (s, e, _p) in enumerate(notes)
+    ]
+
+
+# ============================================================
+# 主唱音域自動歸位（--vocal-register-fit）
+# ============================================================
+#
+# 有些歌轉出來整體偏高、有些偏低；還有些歌同時有男聲跟
+# 女聲、兩個音域差很多。這裡做兩層修正（都只動整個八度，
+# 不改音高內容、不改節奏）：
+#
+#   1. 聲部八度驗證：RMVPE 對低男聲 / 氣聲偶爾會「整段」
+#      鎖在高八度（女聲偶爾整段低八度）。這種整段一致的
+#      錯誤沒有局部對比，fold_melody_register 抓不到，
+#      所以這裡把音符依靜音切成短語，用 vocals 音訊的
+#      諧波分數驗證整段該留在哪個八度。
+#
+#   2. 音域帶歸位：NBS 舒適音域是 key 33~57（MIDI 54~78，
+#      Minecraft 原生可彈的兩個八度）。整體偏高 / 偏低時
+#      全曲整數個八度歸位；偵測到男聲 + 女聲兩個音域群
+#      （間隔夠遠、中間有谷底）時，兩個聲部分別歸位——
+#      已經剛剛好的聲部不動，只修偏高 / 偏低的那個。
+#
+# legacy preset 一律關閉，維持舊輸出 byte 不變。
+# ============================================================
+
+REGISTER_FIT_BAND = (54.0, 78.0)   # 舒適音域（MIDI）
+REGISTER_FIT_CENTER = 66.0         # 覆蓋率與 |k| 都同分時偏好靠攏的中心
+REGISTER_PHRASE_GAIN = 1.5         # 短語整體搬移需要的諧波支持倍率
+REGISTER_PHRASE_FLOOR = 0.02       # 諧波分數絕對下限
+REGISTER_MIN_IMPROVE = 0.15        # 音域歸位需要的覆蓋率改善幅度
+REGISTER_DUET_MIN_SEP = 10.0       # 雙聲部兩群的最小間隔（半音）
+REGISTER_DUET_VALLEY = 0.55        # 兩群之間谷底深度上限（越小越確認分群）
+REGISTER_DUET_MIN_FRAC = 0.15      # 每個聲部最少時長佔比
+REGISTER_SEP_BONUS = 0.15          # 歸位後兩聲部仍分離 >= 9 半音的加分
+REGISTER_FIT_SATISFIED = 0.95      # 覆蓋率達此值的聲部不再搬移
+
+
+_MIDI_NAMES = (
+    "C", "C#", "D", "D#", "E", "F",
+    "F#", "G", "G#", "A", "A#", "B",
+)
+
+
+def _midi_name(midi):
+    """MIDI 數字 → 顯示名（例如 60 → C4），只用在 log。"""
+    m = int(round(midi))
+    return f"{_MIDI_NAMES[m % 12]}{m // 12 - 1}"
+
+
+def _weighted_median(values, weights):
+    """加權中位數（values / weights 為一維序列）。"""
+    v = np.asarray(values, dtype=float)
+    w = np.asarray(weights, dtype=float)
+    order = np.argsort(v, kind="stable")
+    v = v[order]
+    w = w[order]
+    cw = np.cumsum(w)
+    if cw[-1] <= 0:
+        return float(np.median(v))
+    idx = int(np.searchsorted(cw, 0.5 * cw[-1]))
+    return float(v[min(idx, len(v) - 1)])
+
+
+def _split_phrases(notes, gap_sec):
+    """把音符依靜音切成短語，回傳每個短語的索引清單。"""
+    phrases = []
+    cur = []
+    prev_end = None
+
+    for i, (s, e, _p) in enumerate(notes):
+
+        if (
+            prev_end is not None
+            and float(s) - prev_end > gap_sec
+        ):
+            phrases.append(cur)
+            cur = []
+
+        cur.append(i)
+        prev_end = (
+            float(e)
+            if prev_end is None
+            else max(prev_end, float(e))
+        )
+
+    if cur:
+        phrases.append(cur)
+
+    return phrases
+
+
+def _two_means(values, weights, iters=50):
+    """一維加權 2-means（決定性：以加權 10% / 90% 分位初始化）。
+
+    回傳 (c_lo, c_hi)；資料擠在一起時兩者可能相等。
+    用極端分位初始化，男女聲比例偏斜（如 80% / 20%）
+    時也分得出兩群；誤分由間隔 / 谷底關卡擋掉。
+    """
+    v = np.asarray(values, dtype=float)
+    w = np.asarray(weights, dtype=float)
+
+    def _wpct(q):
+        order = np.argsort(v, kind="stable")
+        cw = np.cumsum(w[order])
+        if cw[-1] <= 0:
+            return float(v[len(v) // 2])
+        idx = int(np.searchsorted(cw, q * cw[-1]))
+        idx = min(idx, len(v) - 1)
+        return float(v[order][idx])
+
+    c_lo = _wpct(0.10)
+    c_hi = _wpct(0.90)
+
+    if c_lo == c_hi:
+        return c_lo, c_hi
+
+    for _ in range(iters):
+
+        m_lo = (v - c_lo) <= (c_hi - v)
+
+        if m_lo.all() or (~m_lo).all():
+            break
+
+        w_lo = float(w[m_lo].sum())
+        w_hi = float(w[~m_lo].sum())
+
+        if w_lo <= 0 or w_hi <= 0:
+            break
+
+        new_lo = float((v[m_lo] * w[m_lo]).sum() / w_lo)
+        new_hi = float((v[~m_lo] * w[~m_lo]).sum() / w_hi)
+
+        if new_lo == c_lo and new_hi == c_hi:
+            break
+
+        c_lo, c_hi = new_lo, new_hi
+
+    if c_lo > c_hi:
+        c_lo, c_hi = c_hi, c_lo
+
+    return c_lo, c_hi
+
+
+def _valley_ratio(values, weights, c_lo, c_hi):
+    """兩個音域群中心之間的「谷底 / 峰值」深度比（0~1）。
+
+    越小代表兩群中間越空、越像真的分成男聲 / 女聲兩群；
+    回傳 None 代表無法計算（兩群太近）。
+    """
+    v = np.asarray(values, dtype=float)
+    w = np.asarray(weights, dtype=float)
+
+    lo = int(np.floor(v.min()))
+    hi = int(np.ceil(v.max()))
+    nbins = hi - lo + 1
+    hist = np.zeros(nbins)
+
+    for p, wt in zip(v, w):
+        b = int(round(p)) - lo
+        hist[min(max(b, 0), nbins - 1)] += wt
+
+    k = np.array([1.0, 2.0, 3.0, 2.0, 1.0])
+    k /= k.sum()
+    sm = np.convolve(hist, k, mode="same")
+
+    b_lo = min(max(int(round(c_lo)) - lo, 0), nbins - 1)
+    b_hi = min(max(int(round(c_hi)) - lo, 0), nbins - 1)
+
+    if b_hi - b_lo < 2:
+        return None
+
+    peak_lo = float(sm[max(0, b_lo - 2):b_lo + 3].max())
+    peak_hi = float(sm[max(0, b_hi - 2):b_hi + 3].max())
+    valley = float(sm[b_lo + 1:b_hi].min())
+
+    return valley / max(min(peak_lo, peak_hi), 1e-9)
+
+
+def auto_fit_vocal_register(
+    notes,
+    y_vocal=None,
+    sr=None,
+    max_octaves=2,
+    phrase_gap=0.7,
+    verbose=True,
+):
+    """主唱音域自動歸位：把「有時太高、有時太低」的人聲轉譜
+    自動調到剛剛好的八度。
+
+    第 1 層（聲部八度驗證）：把音符依靜音切成短語，整個短語
+    在 ±max_octaves 個八度副本上取 vocals 諧波分數平均；
+    音訊明顯支持別的八度（>= REGISTER_PHRASE_GAIN 倍且超過
+    絕對下限）才整段搬移——專修 RMVPE「整段鎖錯八度」，
+    孤立跳錯仍交給 fold_melody_register。
+
+    第 2 層（音域帶歸位）：以 NBS 舒適音域（REGISTER_FIT_BAND）
+    為目標，整體偏高 / 偏低時全曲整數個八度歸位；若偵測到
+    男聲 + 女聲兩個音域群（間隔 >= REGISTER_DUET_MIN_SEP、
+    中間有谷底、各自時長 >= REGISTER_DUET_MIN_FRAC），兩個
+    聲部分別選八度——已經幾乎整段都在舒適音域的聲部不動，
+    只修真正偏高 / 偏低的那個。短語內部一律整段同搬，
+    真實的八度跳躍不會被拆掉。
+
+    只動八度（±12 / ±24），沒有足夠證據時維持原樣。
+    """
+
+    if len(notes) < 3:
+        return [(s, e, p) for s, e, p in notes]
+
+    notes = sorted(
+        notes,
+        key=lambda x: (float(x[0]), float(x[1])),
+    )
+
+    starts = np.array([float(s) for s, _e, _p in notes])
+    ends = np.array([float(e) for _s, e, _p in notes])
+    pitches = np.array([float(p) for _s, _e, p in notes])
+    weights = np.maximum(ends - starts, 0.05)
+
+    out = pitches.copy()
+    phrases = _split_phrases(notes, phrase_gap)
+
+    # ---------------- 第 1 層：聲部八度驗證 ----------------
+
+    if y_vocal is not None and sr is not None:
+
+        for idx in phrases:
+
+            if len(idx) < 3:
+                continue
+
+            dur = float(weights[idx].sum())
+            if dur < 0.30:
+                continue
+
+            p_seg = pitches[idx]
+
+            # 跨度太大（可能含真實八度跳躍或雙聲部交疊）
+            # 的短語不要整段搬。
+            spread = float(
+                np.percentile(p_seg, 90)
+                - np.percentile(p_seg, 10)
+            )
+            if spread > 14.0:
+                continue
+
+            # 每個候選八度：整個短語逐音取諧波分數平均
+            # （單音雜訊會被平均稀釋，整段一致錯才搬得動）。
+            scores = {}
+
+            for k in range(-max_octaves, max_octaves + 1):
+
+                per = []
+
+                for j in idx:
+
+                    cand = pitches[j] + 12 * k
+
+                    if cand < 36 or cand > 96:
+                        per = []
+                        break
+
+                    per.append(
+                        _harmonic_octave_score(
+                            y_vocal,
+                            sr,
+                            float(starts[j]),
+                            float(ends[j]),
+                            cand,
+                        )
+                    )
+
+                if per:
+                    scores[k] = float(np.mean(per))
+
+            if 0 not in scores or len(scores) < 2:
+                continue
+
+            best_k = max(scores, key=lambda k: scores[k])
+
+            if best_k == 0:
+                continue
+
+            if scores[best_k] < max(
+                REGISTER_PHRASE_FLOOR,
+                scores[0] * REGISTER_PHRASE_GAIN,
+            ):
+                continue
+
+            out[idx] = pitches[idx] + 12.0 * best_k
+
+            if verbose:
+                med = float(np.median(p_seg))
+                print(
+                    f"  聲部八度驗證：{_midi_name(med)} 附近整段 "
+                    f"→ {_midi_name(med + 12 * best_k)}"
+                    f"（{len(idx)} 個音，諧波支持 "
+                    f"{scores[best_k] / max(scores[0], 1e-9):.1f} 倍）"
+                )
+
+    # ---------------- 第 2 層：音域帶歸位 ----------------
+
+    fit_low, fit_high = REGISTER_FIT_BAND
+
+    def _coverage(ps, ws, k):
+        """把群組整體移 12k 個半音後，落在舒適音域內的時長比。"""
+        lo = fit_low - 12.0 * k
+        hi = fit_high - 12.0 * k
+        m = (ps >= lo) & (ps <= hi)
+        tot = float(ws.sum())
+        if tot <= 0:
+            return 0.0
+        return float(ws[m].sum()) / tot
+
+    def _pair_bonus(sep):
+        """雙聲部歸位後的音域分離加分 / 碰撞扣分。"""
+        if sep >= 9.0:
+            return REGISTER_SEP_BONUS
+        return 0.0
+
+    fit_notes = len(out) >= 8
+
+    if fit_notes:
+
+        m_all = _weighted_median(out, weights)
+
+        lo_c, hi_c = _two_means(out, weights)
+        duet = (
+            hi_c - lo_c >= REGISTER_DUET_MIN_SEP
+            and len(out) >= 12
+        )
+
+        mask_lo = None
+
+        if duet:
+
+            mask_lo = (out - lo_c) <= (hi_c - out)
+            frac_lo = float(
+                weights[mask_lo].sum() / weights.sum()
+            )
+            n_lo = int(mask_lo.sum())
+
+            duet = (
+                REGISTER_DUET_MIN_FRAC
+                <= frac_lo
+                <= 1.0 - REGISTER_DUET_MIN_FRAC
+                and n_lo >= 5
+                and (len(out) - n_lo) >= 5
+            )
+
+        if duet:
+            vr = _valley_ratio(out, weights, lo_c, hi_c)
+            duet = vr is not None and vr <= REGISTER_DUET_VALLEY
+
+        if duet:
+
+            # 男聲 + 女聲：兩個聲部各自挑八度，聯合評分。
+            # 覆蓋率主導；已經幾乎整段都在舒適音域（>= 95%）
+            # 的聲部不再搬移——「已經剛剛好就不要動」，
+            # 只修真正偏高 / 偏低的那個聲部。
+            p_lo = out[mask_lo]
+            w_lo = weights[mask_lo]
+            p_hi = out[~mask_lo]
+            w_hi = weights[~mask_lo]
+            m_lo = _weighted_median(p_lo, w_lo)
+            m_hi = _weighted_median(p_hi, w_hi)
+
+            def _pair_score(k1, k2):
+                sep = (m_hi + 12.0 * k2) - (m_lo + 12.0 * k1)
+                return (
+                    _coverage(p_lo, w_lo, k1)
+                    + _coverage(p_hi, w_hi, k2)
+                    + _pair_bonus(sep)
+                )
+
+            all_ks = range(-max_octaves, max_octaves + 1)
+
+            ks_lo = (
+                all_ks
+                if _coverage(p_lo, w_lo, 0) < REGISTER_FIT_SATISFIED
+                else (0,)
+            )
+            ks_hi = (
+                all_ks
+                if _coverage(p_hi, w_hi, 0) < REGISTER_FIT_SATISFIED
+                else (0,)
+            )
+
+            best = None
+
+            for k1 in ks_lo:
+                for k2 in ks_hi:
+
+                    key = (
+                        -_pair_score(k1, k2),
+                        abs(k1) + abs(k2),
+                        abs(k1),
+                        abs(k2),
+                        k1,
+                        k2,
+                    )
+
+                    if best is None or key < best[0]:
+                        best = (key, k1, k2)
+
+            _key, k1, k2 = best
+
+            if (k1 or k2) and (
+                _pair_score(k1, k2) - _pair_score(0, 0)
+                >= REGISTER_MIN_IMPROVE
+            ):
+
+                shifted = out.copy()
+
+                # 依短語歸屬整段同搬，短語內部音程不變。
+                # 歸屬用短語內 2-means 標記的多數決（與覆蓋率
+                # 統計一致），平手時用加權中位數離哪個中心近。
+                for idx in phrases:
+
+                    n_lo = sum(1 for j in idx if mask_lo[j])
+                    n_hi = len(idx) - n_lo
+
+                    if n_lo == n_hi:
+                        pm = _weighted_median(
+                            out[idx], weights[idx]
+                        )
+                        is_lo = (pm - lo_c) <= (hi_c - pm)
+                    else:
+                        is_lo = n_lo > n_hi
+
+                    if is_lo:
+                        shifted[idx] = out[idx] + 12.0 * k1
+                    else:
+                        shifted[idx] = out[idx] + 12.0 * k2
+
+                n_move = int((shifted != out).sum())
+
+                if n_move:
+
+                    out = shifted
+
+                    if verbose:
+                        print(
+                            "  音域歸位：偵測到兩個聲部"
+                            f"（{_midi_name(m_lo)} / "
+                            f"{_midi_name(m_hi)}）"
+                            f"，調整 {n_move} 個音"
+                        )
+                        if k1:
+                            print(
+                                f"    低聲部 "
+                                f"{'+' if k1 > 0 else ''}{k1} 八度："
+                                f"{_midi_name(m_lo)} → "
+                                f"{_midi_name(m_lo + 12 * k1)}"
+                            )
+                        else:
+                            print(
+                                f"    低聲部維持 "
+                                f"{_midi_name(m_lo)}"
+                            )
+                        if k2:
+                            print(
+                                f"    高聲部 "
+                                f"{'+' if k2 > 0 else ''}{k2} 八度："
+                                f"{_midi_name(m_hi)} → "
+                                f"{_midi_name(m_hi + 12 * k2)}"
+                            )
+                        else:
+                            print(
+                                f"    高聲部維持 "
+                                f"{_midi_name(m_hi)}"
+                            )
+
+        else:
+
+            # 單聲部：全曲整數個八度歸位。
+            # 平手順序：覆蓋率 > 搬最少八度（不離原曲太遠）
+            # > 靠攏 REGISTER_FIT_CENTER。
+            cov0 = _coverage(out, weights, 0)
+
+            cands = []
+
+            for k in range(-max_octaves, max_octaves + 1):
+                cands.append((
+                    -_coverage(out, weights, k),
+                    abs(k),
+                    abs(m_all + 12.0 * k - REGISTER_FIT_CENTER),
+                    k,
+                ))
+            cands.sort()
+
+            best_k = cands[0][3]
+            best_cov = -cands[0][0]
+
+            if (
+                best_k != 0
+                and best_cov >= 0.80
+                and best_cov - cov0 >= REGISTER_MIN_IMPROVE
+            ):
+
+                out = out + 12.0 * best_k
+
+                if verbose:
+                    print(
+                        f"  音域歸位：整體 "
+                        f"{'+' if best_k > 0 else ''}{best_k} 八度"
+                        f"（中位數 {_midi_name(m_all)} → "
+                        f"{_midi_name(m_all + 12.0 * best_k)}，"
+                        f"舒適音域覆蓋率 {cov0 * 100:.0f}% → "
+                        f"{best_cov * 100:.0f}%）"
+                    )
+
+    if verbose and not np.any(np.abs(out - pitches) > 0.5):
+        print("  主唱音域：已在舒適範圍，維持不變")
+
+    return [
+        (float(starts[i]), float(ends[i]), int(round(out[i])))
+        for i in range(len(notes))
     ]
 
 
