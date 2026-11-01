@@ -2230,6 +2230,26 @@ def extract_other_notes(
 # 回傳格式對齊 extract_other_notes()：(start, end, midi_pitch, velocity)。
 # ============================================================
 
+def _resolve_of_path(model_path=None):
+    """解析 O&F tflite 模型路徑（未指定時用腳本同層 models/ 底下的預設檔）。"""
+    if model_path:
+        return model_path
+    base = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(base, "models", "onsets_frames_uni.tflite")
+
+
+def _make_of_worker(path, num_threads=1):
+    """建立單顆 O&F tflite worker。
+
+    舊版 onsets_frames_to_nbs.py 的 OFModel 不支援 num_threads
+    關鍵字參數時，自動退回單參數建構。
+    """
+    try:
+        return _of.OFModel(path, num_threads=num_threads)
+    except TypeError:
+        return _of.OFModel(path)
+
+
 def _get_of_model(model_path=None, engine="tflite"):
     if _of is None:
         raise RuntimeError(
@@ -2242,10 +2262,7 @@ def _get_of_model(model_path=None, engine="tflite"):
     if cache_key in _OF_MODEL_CACHE:
         return _OF_MODEL_CACHE[cache_key]
 
-    base = os.path.dirname(os.path.abspath(__file__))
-    path = model_path or os.path.join(
-        base, "models", "onsets_frames_uni.tflite"
-    )
+    path = _resolve_of_path(model_path)
 
     if not os.path.isfile(path):
         _of.download_model(path)
@@ -2332,9 +2349,11 @@ def _get_of_models(model_path=None, jobs=1):
             f"  Other(neural) → 建立 {jobs} 個 O&F worker "
             f"(各 {threads} threads) ..."
         )
+        # 修正：OFModel 物件沒有 model_path 屬性，改用解析後的模型
+        # 路徑直接重建（_get_of_model 已確保模型檔存在）。
+        path = _resolve_of_path(model_path)
         _OF_MODEL_CACHE[cache_key] = [
-            _of.OFModel(base_model.model_path, num_threads=threads)
-            for _ in range(jobs)
+            _make_of_worker(path, threads) for _ in range(jobs)
         ]
     return _OF_MODEL_CACHE[cache_key]
 
@@ -3246,6 +3265,38 @@ INSTRUMENT_PRESETS = {
 }
 
 
+def resolve_instrument_map(preset_name, overrides=None):
+    """以 preset 為基準套用命令列音色覆蓋，回傳最終 inst_map。
+
+    overrides: part → 音色名（None / 空值代表未指定，保留 preset 值）。
+    --other-instrument 一次設定 Other 三個音域；
+    個別指定 other_low / other_mid / other_high 時優先於它。
+    """
+    instrument_map = dict(INSTRUMENT_PRESETS[preset_name])
+    overrides = overrides or {}
+
+    other_all = overrides.get("other")
+    if other_all:
+        for _band in ("other_low", "other_mid", "other_high"):
+            instrument_map[_band] = other_all
+
+    for _part in (
+        "melody",
+        "bass",
+        "chord",
+        "piano",
+        "guitar",
+        "other_low",
+        "other_mid",
+        "other_high",
+    ):
+        _val = overrides.get(_part)
+        if _val:
+            instrument_map[_part] = _val
+
+    return instrument_map
+
+
 LAYER_NAMES = {
     L_MELODY: "Melody",
     L_BASS: "Bass",
@@ -3394,8 +3445,11 @@ _MIDI_NAMES_PC = ("C", "C#", "D", "D#", "E", "F",
                   "F#", "G", "G#", "A", "A#", "B")
 
 
-def estimate_scale(melody_notes, bass_notes, chords):
-    """Krumhansl-Schmuckler 估計調性。回傳 (tonic, mode, 七個音階音的集合)。"""
+def estimate_scale(melody_notes, bass_notes, chords, return_corr=False):
+    """Krumhansl-Schmuckler 估計調性。回傳 (tonic, mode, 七個音階音的集合)。
+
+    return_corr=True 時多回傳一個相關係數（越高越確定是這個調）。
+    """
     hist = np.zeros(12)
     for n in melody_notes:
         hist[int(round(n[2])) % 12] += max(float(n[1]) - float(n[0]), 0.05)
@@ -3420,6 +3474,8 @@ def estimate_scale(melody_notes, bass_notes, chords):
     _c, tonic, mode = best
     major_tonic = tonic if mode == "major" else (tonic + 3) % 12
     scale = frozenset((major_tonic + d) % 12 for d in _MAJOR_SCALE)
+    if return_corr:
+        return tonic, mode, scale, _c
     return tonic, mode, scale
 
 
@@ -3439,6 +3495,159 @@ def snap_chord(root, quality, scale):
         fifth = 6 if quality == "dim" else 7
     iv = (0, third, fifth)
     return iv, iv != tuple(detected)
+
+
+def _vocal_chroma(y, sr, hop=512):
+    import librosa
+
+    tuning = float(librosa.estimate_tuning(y=y, sr=sr))
+    return librosa.feature.chroma_cqt(
+        y=y, sr=sr, hop_length=hop, tuning=tuning
+    )
+
+
+def scale_from_chroma(chroma):
+    """用音訊 chroma 的整體能量獨立估計調性。回傳 (音階集合, tonic, mode, 相關係數)。"""
+    hist = np.asarray(chroma, dtype=float).sum(axis=1)
+    best = None
+    for tonic in range(12):
+        for mode, prof in (("major", _KS_MAJOR), ("minor", _KS_MINOR)):
+            c = float(np.corrcoef(hist, np.roll(prof, tonic))[0, 1])
+            if c != c:
+                continue
+            if best is None or c > best[0]:
+                best = (c, tonic, mode)
+    if best is None:
+        return None
+    c, tonic, mode = best
+    major_tonic = tonic if mode == "major" else (tonic + 3) % 12
+    return (
+        frozenset((major_tonic + d) % 12 for d in _MAJOR_SCALE),
+        tonic, mode, c,
+    )
+
+
+def fix_melody_to_key(
+    notes,
+    y,
+    sr,
+    scale,
+    margin=1.15,
+    max_window=0.6,
+    hop=512,
+    verbose=True,
+    chroma=None,
+):
+    """旋律調內修正：音階外的音，若人聲 chroma 明顯更支持相鄰的調內音，就改過去。
+
+    轉譜常出現 ±1 半音的誤差，把調內的音抓成音階外的音。原曲沒有轉調時，
+    音階外的音大多是這種誤差；但真正的經過音（chromatic note）也存在，
+    所以不是硬吸附：只有「相鄰調內音的 chroma 能量 > 原音 × margin」
+    才改，原音證據夠強就保留。調內的音完全不動，八度也不動。
+    """
+    import librosa
+
+    if not notes or scale is None:
+        return list(notes), {"out": 0, "changed": 0, "examples": []}
+
+    if chroma is None:
+        chroma = _vocal_chroma(y, sr, hop)
+    fps = sr / hop
+    n_frames = chroma.shape[1]
+
+    out_notes = []
+    stats = {"out": 0, "changed": 0, "examples": []}
+
+    for note in notes:
+        st, en, pitch = float(note[0]), float(note[1]), int(round(note[2]))
+        extra = tuple(note[3:])
+        pc = pitch % 12
+        if pc in scale:
+            out_notes.append(note)
+            continue
+
+        stats["out"] += 1
+        a = int((st + 0.02) * fps)
+        b = int(min(en, st + max_window) * fps)
+        a = max(0, min(a, n_frames - 1))
+        b = max(a + 2, min(b, n_frames))
+        seg = chroma[:, a:b].mean(axis=1)
+
+        cands = [c for c in ((pc - 1) % 12, (pc + 1) % 12) if c in scale]
+        if not cands or float(seg.sum()) <= 1e-6:
+            out_notes.append(note)
+            continue
+
+        best = max(cands, key=lambda c: seg[c])
+        if seg[best] > seg[pc] * margin:
+            delta = (best - pc + 6) % 12 - 6
+            out_notes.append((st, en, pitch + delta) + extra)
+            stats["changed"] += 1
+            if len(stats["examples"]) < 8:
+                stats["examples"].append((st, pitch % 12, best))
+        else:
+            out_notes.append(note)
+
+    # 只改音高：不增不刪音符，也不合併相鄰的同音
+    # （連續音節唱同一個音很常見，轉譜偵測到的 onset 要保留）。
+    return out_notes, stats
+
+
+def apply_melody_key_fix(
+    melody_notes,
+    bass_notes,
+    chords,
+    vocals_path,
+    sr,
+    margin=1.25,
+    min_corr=0.55,
+):
+    """估計調性 → 讀人聲 stem → 修正音階外的旋律音，並印出統計。"""
+    import librosa
+
+    info = estimate_scale(
+        melody_notes, bass_notes or [], chords or [], return_corr=True
+    )
+    if info is None or info[3] < min_corr:
+        print("  旋律調內修正：調性不明確，略過")
+        return melody_notes
+
+    tonic, mode, scale, corr = info
+    y_voc, _sr = librosa.load(vocals_path, sr=sr, mono=True)
+    chroma = _vocal_chroma(y_voc, sr)
+
+    # 保險：旋律自己估的調性會被轉譜錯誤影響；再用人聲 chroma 獨立估一次，
+    # 兩者的音階一致才修正，否則寧可不動（音階錯了會把對的音改錯）。
+    audio = scale_from_chroma(chroma)
+    if audio is None or audio[0] != scale:
+        a_txt = (
+            f"{_MIDI_NAMES_PC[audio[1]]} {audio[2]}" if audio else "未知"
+        )
+        print(
+            f"  旋律調內修正：旋律推測 {_MIDI_NAMES_PC[tonic]} {mode}、"
+            f"人聲 chroma 推測 {a_txt}，兩者音階不一致，略過"
+        )
+        return melody_notes
+
+    fixed, st = fix_melody_to_key(
+        melody_notes, y_voc, sr, scale, margin=margin, chroma=chroma
+    )
+
+    total = len(melody_notes)
+    print(
+        f"  旋律調內修正：推測調性 {_MIDI_NAMES_PC[tonic]} {mode}"
+        f"（r={corr:.2f}）；音階外 {st['out']}/{total} 個"
+        f"（{st['out'] / max(total, 1) * 100:.0f}%）"
+        f" → 改成調內 {st['changed']} 個，"
+        f"保留 {st['out'] - st['changed']} 個（人聲 chroma 支持原音）"
+    )
+    if st["examples"]:
+        ex = "、".join(
+            f"{t:.1f}s {_MIDI_NAMES_PC[a]}→{_MIDI_NAMES_PC[b]}"
+            for t, a, b in st["examples"]
+        )
+        print(f"    例：{ex}")
+    return fixed
 
 
 _TRIAD_NAME = {(0, 4, 7): "maj", (0, 3, 7): "min", (0, 3, 6): "dim"}
@@ -5020,13 +5229,497 @@ def auto_tps_from_tempo(
     return tps, bpm
 
 
+# ============================================================
+# MIDI 輸出（--format midi / both）
+# ============================================================
+# 純標準庫實作 Standard MIDI File（SMF）Type 1，不新增任何依賴
+# （NBS 封裝本來就是手寫 struct，這裡沿用同一風格）。
+#
+# 音軌配置（完整編制）：
+#   Track 0  指揮軌：曲名 / Tempo / 4/4 拍號 / 和弦 Marker
+#   Track 1  主唱 Vocals（GM Flute）
+#   Track 2  Bass（GM Electric Bass - finger）
+#   Track 3  Piano（GM Acoustic Grand；6-Stem 級聯才有資料）
+#   Track 4  Guitar（GM Acoustic Guitar - steel；6-Stem 級聯才有資料）
+#   Track 5  Other 伴奏（GM String Ensemble 1）
+#   Track 6  Chords 和弦伴奏（--midi-chord-notes 時才輸出）
+#   Track 7  Drums（Channel 10：Kick / Snare / HiHat）
+#
+# 對齊 zzzzmusic.com（轉檔貓咪）的功能：
+#   - 「辨識和弦」：和弦進行寫成 MIDI Marker（DAW 可直接看到），
+#     並在終端印出和弦進行表。
+# ============================================================
+
+MIDI_PPQ = 480          # ticks per quarter note
+
+# GM Program Change（0-indexed 位元組值）。
+MIDI_PROGRAMS = {
+    "melody": 73,       # Flute（對應 NBS preset 的主唱音色）
+    "bass": 33,         # Electric Bass (finger)
+    "piano": 0,         # Acoustic Grand Piano
+    "guitar": 25,       # Acoustic Guitar (steel)
+    "other": 48,        # String Ensemble 1
+    "chords": 0,        # Acoustic Grand Piano
+}
+
+# NBS 鼓層 → GM Drum Map（Channel 10 的 note number）。
+MIDI_DRUM_NOTES = {
+    L_KICK: 36,         # Bass Drum 1
+    L_SNARE: 38,        # Acoustic Snare
+    L_HAT: 42,          # Closed Hi-Hat
+}
+
+# NBS velocity（0~100）→ MIDI velocity（1~127）。
+MIDI_VELOCITY_SCALE = 127.0 / 100.0
+
+# 和弦品質 → 名稱後綴（與 analyze_chords 的 quality 值對應）。
+_MIDI_QUALITY_NAMES = {
+    "maj": "",
+    "min": "m",
+    "7": "7",
+    "maj7": "maj7",
+    "min7": "m7",
+    "sus2": "sus2",
+    "sus4": "sus4",
+    "dim": "dim",
+}
+
+
+def _chord_display_name(root, quality):
+    """(root, quality) → 和弦名稱，如 'C'、'Am'、'G7'、'Fmaj7'。"""
+    return (
+        _MIDI_NAMES_PC[int(root) % 12]
+        + _MIDI_QUALITY_NAMES.get(str(quality), str(quality))
+    )
+
+
+def _format_chord_chart(chords, max_items=64):
+    """和弦進行表：合併連續重複，輸出 '0:12 C  0:19 G  0:25 Am ...'。"""
+    parts = []
+    last_name = None
+    for chord in chords:
+        try:
+            start = float(chord[0])
+            name = _chord_display_name(int(chord[2]), str(chord[3]))
+        except Exception:
+            continue
+        if name == last_name:
+            continue
+        last_name = name
+        minutes = int(start // 60)
+        seconds = int(round(start % 60))
+        if seconds >= 60:
+            minutes += 1
+            seconds -= 60
+        parts.append(f"{minutes}:{seconds:02d} {name}")
+        if len(parts) >= max_items:
+            parts.append("...")
+            break
+    return "  ".join(parts)
+
+
+def _midi_vlq(value):
+    """MIDI Variable Length Quantity 編碼（delta time 用）。"""
+    value = int(max(0, value))
+    out = bytearray([value & 0x7F])
+    value >>= 7
+    while value:
+        out.append((value & 0x7F) | 0x80)
+        value >>= 7
+    return bytes(reversed(out))
+
+
+def _midi_meta_bytes(meta_type, data):
+    return (
+        b"\xff"
+        + bytes([int(meta_type) & 0x7F])
+        + _midi_vlq(len(data))
+        + data
+    )
+
+
+def _midi_text_bytes(meta_type, text):
+    return _midi_meta_bytes(
+        meta_type,
+        str(text).encode("utf-8", errors="replace"),
+    )
+
+
+def _midi_track_chunk(events):
+    """events: [(tick, sort_order, payload)] → MTrk chunk。
+
+    同一 tick 依 sort_order 排序：0 = note-off / meta，2 = note-on。
+    這樣同 pitch 重新觸發時 note-off 會先於 note-on，避免前一音
+    的 note-off 把剛觸發的音截斷。
+    """
+    events = sorted(events, key=lambda e: (e[0], e[1], e[2]))
+    body = bytearray()
+    prev_tick = 0
+    for tick, _order, payload in events:
+        body += _midi_vlq(max(0, int(tick) - prev_tick))
+        body += payload
+        prev_tick = int(tick)
+    body += b"\x00\xff\x2f\x00"          # End of Track
+    return b"MTrk" + struct.pack(">I", len(body)) + bytes(body)
+
+
+def build_midi_bytes(
+    melody_notes=(),
+    bass_notes=(),
+    other_notes=(),
+    chords=(),
+    drum_hits=(),
+    piano_notes=None,
+    guitar_notes=None,
+    chord_notes=None,
+    tempo_bpm=None,
+    song_name="",
+    include_vocals=True,
+    octave_bias=None,
+):
+    """把轉譜結果封裝成 SMF Type 1 .mid。
+
+    - 音高使用轉譜管線的絕對 MIDI pitch（不是 NBS 的相對 key），
+      並套用 --*-octave-shift（與 NBS 輸出同方向，每 +1 = 高八度），
+      讓兩種輸出的音域一致。
+    - Tempo：與 auto_tps_from_tempo 相同把 BPM 摺回 70~180，避免
+      librosa 抓成一半/兩倍時 MIDI 拍速離譜；偵測失敗退回 120。
+    - velocity：NBS 的 0~100 線性映射到 MIDI 的 1~127。
+    """
+    octave_bias = octave_bias or {}
+
+    bpm = 120.0
+    if (
+        tempo_bpm is not None
+        and np.isfinite(tempo_bpm)
+        and float(tempo_bpm) > 0
+    ):
+        bpm = float(tempo_bpm)
+        while bpm < 70.0:
+            bpm *= 2.0
+        while bpm > 180.0:
+            bpm /= 2.0
+    usec_per_quarter = int(round(60_000_000.0 / bpm))
+
+    def t2k(t):
+        """秒 → tick（PPQ=480，依 BPM 換算）。"""
+        return int(round(float(t) * bpm / 60.0 * MIDI_PPQ))
+
+    # ---------------- 指揮軌（Tempo / 拍號 / 和弦 Marker） ----------------
+
+    conductor = [
+        (0, 1, _midi_text_bytes(0x03, str(song_name or "mp3_to_nbs"))),
+        (0, 1, _midi_meta_bytes(0x58, bytes([4, 2, 24, 8]))),   # 4/4
+        (
+            0, 1,
+            _midi_meta_bytes(0x51, usec_per_quarter.to_bytes(3, "big")),
+        ),
+        (
+            0, 1,
+            _midi_text_bytes(
+                0x01,
+                f"Tempo {bpm:.1f} BPM | mp3_to_nbs --format midi",
+            ),
+        ),
+    ]
+
+    for chord in chords:
+        try:
+            start = float(chord[0])
+            name = _chord_display_name(int(chord[2]), str(chord[3]))
+        except Exception:
+            continue
+        conductor.append(
+            (max(0, t2k(start)), 1, _midi_text_bytes(0x06, name))
+        )
+
+    tracks = [_midi_track_chunk(conductor)]
+
+    # ---------------- 音符軌 ----------------
+
+    def add_note_track(
+        name, program, notes, default_vel,
+        octave_shift=0, channel=0,
+    ):
+        events = [
+            (0, 1, _midi_text_bytes(0x03, name)),
+            (
+                0, 1,
+                bytes([0xC0 | (channel & 0x0F), int(program) & 0x7F]),
+            ),
+        ]
+
+        # 同 pitch 分組：後一音 onset 前截止前一音，避免同音重疊時
+        # note-off 誤殺後一個音（NBS 封裝同 layer 也是同音互斥）。
+        by_pitch = {}
+        for note in notes:
+            try:
+                start = float(note[0])
+                end = float(note[1])
+                pitch = int(note[2]) + 12 * int(octave_shift)
+            except Exception:
+                continue
+            vel = int(note[3]) if len(note) >= 4 else None
+            by_pitch.setdefault(pitch, []).append((start, end, vel))
+
+        ch = channel & 0x0F
+        for pitch, group in sorted(by_pitch.items()):
+            midi_pitch = int(_clip(pitch, 0, 127))
+            group.sort(key=lambda x: (x[0], x[1]))
+            for i, (start, end, vel) in enumerate(group):
+                if end <= start:
+                    continue
+                on_tick = max(0, t2k(start))
+                off_tick = max(on_tick + 1, t2k(end))
+                if i + 1 < len(group):
+                    next_on = t2k(group[i + 1][0])
+                    if next_on > on_tick:
+                        off_tick = min(off_tick, next_on)
+                if vel is None:
+                    midi_vel = int(default_vel)
+                else:
+                    midi_vel = int(
+                        round(_clip(vel, 0, 100) * MIDI_VELOCITY_SCALE)
+                    )
+                midi_vel = int(_clip(midi_vel, 1, 127))
+                events.append(
+                    (on_tick, 2, bytes([0x90 | ch, midi_pitch, midi_vel]))
+                )
+                events.append(
+                    (off_tick, 0, bytes([0x80 | ch, midi_pitch, 0]))
+                )
+
+        tracks.append(_midi_track_chunk(events))
+
+    if include_vocals:
+        add_note_track(
+            "Vocals / Melody",
+            MIDI_PROGRAMS["melody"],
+            melody_notes,
+            92,
+            octave_shift=octave_bias.get("melody", 0),
+        )
+
+    add_note_track(
+        "Bass",
+        MIDI_PROGRAMS["bass"],
+        bass_notes,
+        82,
+        octave_shift=octave_bias.get("bass", 0),
+    )
+
+    if piano_notes:
+        add_note_track(
+            "Piano", MIDI_PROGRAMS["piano"], piano_notes, 80,
+        )
+
+    if guitar_notes:
+        add_note_track(
+            "Guitar", MIDI_PROGRAMS["guitar"], guitar_notes, 80,
+        )
+
+    add_note_track(
+        "Other / Accompaniment",
+        MIDI_PROGRAMS["other"],
+        other_notes,
+        72,
+        octave_shift=octave_bias.get("other", 0),
+    )
+
+    if chord_notes:
+        add_note_track(
+            "Chords",
+            MIDI_PROGRAMS["chords"],
+            chord_notes,
+            60,
+            octave_shift=octave_bias.get("other", 0),
+        )
+
+    # ---------------- 鼓軌（Channel 10） ----------------
+
+    drum_events = [
+        (0, 1, _midi_text_bytes(0x03, "Drums")),
+    ]
+
+    for hit in drum_hits:
+        try:
+            layer = int(hit[0])
+            t = float(hit[1])
+            vel = int(hit[2])
+        except Exception:
+            continue
+        note = MIDI_DRUM_NOTES.get(layer)
+        if note is None:
+            continue
+        on_tick = max(0, t2k(t))
+        off_tick = on_tick + max(1, t2k(0.05))
+        midi_vel = int(_clip(round(vel * MIDI_VELOCITY_SCALE), 1, 127))
+        drum_events.append(
+            (on_tick, 2, bytes([0x90 | 9, note, midi_vel]))
+        )
+        drum_events.append(
+            (off_tick, 0, bytes([0x80 | 9, note, 0]))
+        )
+
+    tracks.append(_midi_track_chunk(drum_events))
+
+    header = b"MThd" + struct.pack(">IHHH", 6, 1, len(tracks), MIDI_PPQ)
+    return header + b"".join(tracks)
+
+
+# ============================================================
+# 只有 4 軌分離模式（--separate-only）
+# ============================================================
+# 對齊 zzzzmusic.com（轉檔貓咪）的「拆分四音軌」功能：
+# 只跑 Demucs 分離、輸出 vocals/drums/bass/other 四個 WAV 就結束，
+# 完全不轉譜；每一軌可用 --stem-gain 單獨調整音量或靜音（0），
+# 並可用 --separate-instrumental 額外混出去人聲的伴奏版。
+# ============================================================
+
+_STEM_NAMES = ("vocals", "drums", "bass", "other")
+
+
+def _parse_stem_gains(spec):
+    """解析 'vocals=1.2,drums=0' → dict；0 代表靜音（不輸出該軌）。"""
+    if not spec:
+        return {}
+    gains = {}
+    for part in str(spec).split(","):
+        part = part.strip()
+        if not part:
+            continue
+        name, sep, raw = part.partition("=")
+        name = name.strip().lower()
+        if not sep or name not in _STEM_NAMES:
+            raise argparse.ArgumentTypeError(
+                f"無法解析 {part!r}；格式：stem=倍率，"
+                f"stem 可選 {'/'.join(_STEM_NAMES)}"
+            )
+        try:
+            gain = float(raw.strip())
+        except ValueError:
+            raise argparse.ArgumentTypeError(
+                f"音量倍率必須是數字：{part!r}"
+            )
+        if gain < 0:
+            raise argparse.ArgumentTypeError(
+                f"音量倍率不可為負：{part!r}（0 = 靜音）"
+            )
+        gains[name] = gain
+    return gains
+
+
+def _run_separate_only(args, mp3_path):
+    """--separate-only：只執行 Demucs 4-Stem 分離並輸出 WAV，不轉譜。"""
+    import soundfile as sf
+
+    base = os.path.splitext(os.path.basename(mp3_path))[0]
+    if args.output:
+        out_dir = args.output
+    else:
+        out_dir = os.path.join(
+            os.path.dirname(os.path.abspath(mp3_path)),
+            f"{base}_stems",
+        )
+    os.makedirs(out_dir, exist_ok=True)
+
+    gains = args.stem_gain or {}
+
+    print()
+    print("========================================")
+    print(" MP3 → Demucs 4-Stem 分離（separate-only）")
+    print("========================================")
+    print()
+    print(f"輸出目錄：{out_dir}")
+    if gains:
+        print(
+            "每軌音量："
+            + ", ".join(f"{k}={v:g}" for k, v in sorted(gains.items()))
+            + "（未列出的軌 = 1.0；0 = 靜音不輸出）"
+        )
+
+    with tempfile.TemporaryDirectory() as tmp:
+        stems = separate_4stems(
+            mp3_path,
+            tmp,
+            model=args.demucs_model,
+            device=args.device,
+            segment=args.segment,
+            inprocess=args.demucs_inprocess,
+        )
+
+        stem_data = {}
+        sr = None
+        for name in _STEM_NAMES:
+            data, sr = sf.read(
+                stems[name], dtype="float32", always_2d=True
+            )
+            gain = float(gains.get(name, 1.0))
+            if gain <= 0.0:
+                print(f"  {name}.wav → 音量 0（靜音），跳過輸出")
+                continue
+            if gain != 1.0:
+                data = np.clip(data * gain, -1.0, 1.0)
+            out_path = os.path.join(out_dir, f"{name}.wav")
+            sf.write(out_path, data, sr)
+            stem_data[name] = data
+            dur = data.shape[0] / float(sr)
+            size_mb = os.path.getsize(out_path) / (1024.0 * 1024.0)
+            print(
+                f"  {name}.wav → {dur:.1f} 秒，{size_mb:.1f} MB"
+                + (f"（音量 x{gain:g}）" if gain != 1.0 else "")
+            )
+
+        if args.separate_instrumental:
+            parts = [
+                stem_data[name]
+                for name in ("drums", "bass", "other")
+                if name in stem_data
+            ]
+            if not parts or sr is None:
+                print(
+                    "  [WARN] drums/bass/other 全被靜音，"
+                    "無法產生 instrumental.wav"
+                )
+            else:
+                min_len = min(p.shape[0] for p in parts)
+                mix = np.sum(
+                    np.stack(
+                        [p[:min_len].astype(np.float32) for p in parts],
+                        axis=0,
+                    ),
+                    axis=0,
+                )
+                peak = float(np.max(np.abs(mix))) if mix.size else 0.0
+                if peak > 0.98:
+                    mix = mix * (0.98 / peak)
+                inst_path = os.path.join(out_dir, "instrumental.wav")
+                sf.write(inst_path, mix.astype(np.float32), sr)
+                size_mb = (
+                    os.path.getsize(inst_path) / (1024.0 * 1024.0)
+                )
+                print(
+                    f"  instrumental.wav → 伴奏混音"
+                    f"（drums+bass+other，去人聲），"
+                    f"{mix.shape[0] / float(sr):.1f} 秒，"
+                    f"{size_mb:.1f} MB"
+                )
+
+    print()
+    print("================================")
+    print("分離完成")
+    print(f"輸出目錄：{out_dir}")
+    print("================================")
+    return out_dir
+
+
 def main():
 
     conversion_start = time.perf_counter()
 
     ap = argparse.ArgumentParser(
         description=(
-            "MP3 → Demucs 4-Stem → NBS"
+            "MP3 → Demucs 4-Stem → NBS / MIDI"
         )
     )
 
@@ -5039,7 +5732,10 @@ def main():
         "-o",
         "--output",
         default=None,
-        help="nbs 路徑",
+        help=(
+            "輸出路徑：NBS 模式為 .nbs 檔；MIDI 模式自動換成 .mid；"
+            "--separate-only 時為輸出目錄"
+        ),
     )
 
     ap.add_argument(
@@ -5206,6 +5902,20 @@ def main():
                 )
             ),
         )
+
+    # Other 三個音域一次設定（副旋律總開關）。
+    # 個別 --other-low/other-mid/other-high-instrument 指定時優先於它。
+    instrument_group.add_argument(
+        "--other-instrument",
+        dest="other_instrument",
+        choices=sorted(set(INSTR)),
+        default=None,
+        help=(
+            "Other（副旋律）低/中/高三個音域統一音色；"
+            "未指定時使用 preset，"
+            "個別 --other-low-instrument 等會再覆蓋這個值。"
+        ),
+    )
 
     # ========================================================
     # 動態力度 / panning（Phase B）
@@ -5981,6 +6691,101 @@ def main():
         ),
     )
 
+    nbs_group.add_argument(
+        "--melody-key-fix",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "旋律調內修正：音階外的音，若人聲 chroma 明顯更支持相鄰的調內音"
+            "就改過去（修轉譜的 ±1 半音誤差）。調內的音與八度不動。"
+            "未指定時依 preset：legacy=off、其餘=on"
+        ),
+    )
+
+    nbs_group.add_argument(
+        "--melody-key-fix-margin",
+        type=float,
+        default=1.25,
+        metavar="倍數",
+        help=(
+            "調內修正的門檻：相鄰調內音的 chroma 能量要超過原音這個倍數才改"
+            "（預設 %(default)s；越大越保守）"
+        ),
+    )
+
+    # ========================================================
+    # 輸出模式（NBS / MIDI）
+    # ========================================================
+
+    format_group = ap.add_argument_group(
+        "輸出模式（NBS / MIDI）"
+    )
+
+    format_group.add_argument(
+        "--format",
+        choices=("nbs", "midi", "both"),
+        default="nbs",
+        help=(
+            "輸出格式。nbs = 只輸出 .nbs（預設，行為與舊版完全相同）；"
+            "midi = 只輸出 .mid（SMF Type 1：主唱/Bass/Piano/Guitar/"
+            "Other/鼓 各一軌 + 和弦 Marker）；"
+            "both = NBS 與 MIDI 都輸出"
+            "（預設: %(default)s）"
+        ),
+    )
+
+    format_group.add_argument(
+        "--midi-chord-notes",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "MIDI 額外輸出「和弦伴奏」音軌（用 --other-chord-* 參數生成，"
+            "與 hybrid 模式的和弦補缺同一套）。預設關閉：和弦只寫成"
+            "指揮軌 Marker，不另外出音符。"
+        ),
+    )
+
+    # ========================================================
+    # 只有 4 軌分離模式
+    # ========================================================
+
+    sep_group = ap.add_argument_group(
+        "只有 4 軌分離模式（--separate-only）"
+    )
+
+    sep_group.add_argument(
+        "--separate-only",
+        action="store_true",
+        help=(
+            "只執行 Demucs 4-Stem 分離：輸出 vocals/drums/bass/other "
+            "4 個 WAV 到 <歌名>_stems/（或 -o 指定的目錄）後直接結束，"
+            "完全不轉譜。對齊轉檔貓咪「拆分四音軌」功能"
+        ),
+    )
+
+    sep_group.add_argument(
+        "--separate-instrumental",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "--separate-only 時額外混出伴奏版 instrumental.wav"
+            "（drums+bass+other，去人聲）"
+        ),
+    )
+
+    sep_group.add_argument(
+        "--stem-gain",
+        type=_parse_stem_gains,
+        default=None,
+        metavar="stem=倍率",
+        help=(
+            "--separate-only 時每一軌的音量倍率，格式："
+            "vocals=1.2,drums=0.8,bass=1,other=1；0 = 靜音（不輸出該軌）。"
+            "對齊轉檔貓咪「拆分四音軌」每軌可單獨調整音量/靜音；"
+            "未指定的軌 = 1.0（原始音量）"
+        ),
+    )
+
     args = ap.parse_args()
 
     # 命令列是否出現過某個選項（給 preset 判斷「使用者是否明確指定」）。
@@ -5999,25 +6804,29 @@ def main():
     # preset 提供各聲部基準音色；命令列明確指定的
     # --*-instrument 優先（default=None 代表未指定）。
     # ========================================================
-    instrument_map = dict(
-        INSTRUMENT_PRESETS[args.instrument_preset]
+    _inst_overrides = {
+        _part: getattr(args, f"{_part}_instrument")
+        for _part, _, _ in _part_instrument_specs
+    }
+    if getattr(args, "other_instrument", None):
+        _inst_overrides["other"] = args.other_instrument
+
+    instrument_map = resolve_instrument_map(
+        args.instrument_preset,
+        _inst_overrides,
     )
 
-    for _part, _label, _allow_auto in _part_instrument_specs:
-        override = getattr(args, f"{_part}_instrument")
-        if override:
-            instrument_map[_part] = override
+    _has_inst_override = (
+        any(
+            getattr(args, f"{p}_instrument") is not None
+            for p, _, _ in _part_instrument_specs
+        )
+        or getattr(args, "other_instrument", None) is not None
+    )
 
     print(
         f"樂器 preset：{args.instrument_preset}"
-        + (
-            ""
-            if all(
-                getattr(args, f"{p}_instrument") is None
-                for p, _, _ in _part_instrument_specs
-            )
-            else "（含命令列覆蓋）"
-        )
+        + ("（含命令列覆蓋）" if _has_inst_override else "")
     )
     print(
         "  "
@@ -6089,6 +6898,9 @@ def main():
 
     if args.chord_polish is None:
         args.chord_polish = args.instrument_preset != "legacy"
+
+    if args.melody_key_fix is None:
+        args.melody_key_fix = args.instrument_preset != "legacy"
 
     if args.chord_pattern is None:
         args.chord_pattern = (
@@ -6230,12 +7042,28 @@ def main():
         )[0]
     )
 
+    midi_path = None
+
+    # ========================================================
+    # 只有 4 軌分離模式：只跑 Demucs，輸出 4 個 WAV 就結束
+    # ========================================================
+    if args.separate_only:
+        _run_separate_only(args, mp3_path)
+        return
+
+    if args.format == "midi":
+        banner_title = " MP3 → MIDI 音樂轉譜"
+    elif args.format == "both":
+        banner_title = " MP3 → NBS + MIDI 音樂轉譜"
+    else:
+        banner_title = " MP3 → NBS 音樂轉譜"
+
     print()
     print(
         "========================================"
     )
     print(
-        " MP3 → NBS 音樂轉譜"
+        banner_title
     )
     print(
         "========================================"
@@ -6961,6 +7789,21 @@ def main():
             )
 
         # ------------------------------------------------
+        # 旋律調內修正（--melody-key-fix）：放在八度校正之後。
+        # 只動音階外的音，且要人聲 chroma 明顯支持相鄰調內音才改。
+        # ------------------------------------------------
+
+        if args.melody_key_fix and melody_notes:
+            melody_notes = apply_melody_key_fix(
+                melody_notes,
+                bass_notes,
+                chords,
+                stems["vocals"],
+                args.sr,
+                margin=args.melody_key_fix_margin,
+            )
+
+        # ------------------------------------------------
         # Bass 與和弦聯動：只做「八度 / 明顯錯音」修正，
         # 不把經過音全部硬改成 root，保留原曲 bass line。
         # 和弦關閉時 chords=[]，這個區塊會自動跳過。
@@ -7571,98 +8414,176 @@ def main():
             )
 
         # ====================================================
-        # NBS
+        # MIDI（--format midi / both）
+        # 重用 NBS 封裝前的同一份轉譜結果，打包成 SMF Type 1。
         # ====================================================
 
-        print()
-        print(
-            "封裝 NBS ..."
-        )
+        if args.format in ("midi", "both"):
 
-        data = build_nbs_bytes(
-            melody_notes=melody_notes,
+            print()
+            print(
+                "封裝 MIDI ..."
+            )
 
-            bass_notes=bass_notes,
+            midi_chord_notes = []
+            if args.midi_chord_notes:
+                if chords and len(beat_times) > 0:
+                    midi_chord_notes = generate_chord_accompaniment(
+                        chords,
+                        beat_times,
+                        subdivision=args.other_chord_subdivision,
+                        pattern=args.other_chord_pattern,
+                        octave_shift=args.other_octave_shift,
+                        note_len_ratio=args.other_chord_note_len_ratio,
+                        pattern_rotation=args.other_chord_rotation,
+                        skip_ratio=args.other_chord_skip,
+                        humanize_sec=args.other_chord_humanize,
+                        seed=args.seed,
+                    )
+                else:
+                    print(
+                        "  [WARN] 沒有和弦資料"
+                        "（--enable-chord-analysis 未啟用或無和弦），"
+                        "--midi-chord-notes 略過"
+                    )
 
-            other_notes=other_notes,
+            midi_data = build_midi_bytes(
+                melody_notes=melody_notes,
+                bass_notes=bass_notes,
+                other_notes=other_notes,
+                chords=chords,
+                drum_hits=drum_hits,
+                piano_notes=piano_notes,
+                guitar_notes=guitar_notes,
+                chord_notes=midi_chord_notes,
+                tempo_bpm=(
+                    drum_tempo
+                    if (len(drum_beat_times) > 0 and drum_tempo)
+                    else chord_tempo
+                ),
+                song_name=song_name,
+                include_vocals=True,
+                octave_bias={
+                    "melody": args.melody_octave_shift,
+                    "bass": args.bass_octave_shift,
+                    "other": args.other_octave_shift,
+                },
+            )
 
-            chords=chords,
+            midi_path = os.path.splitext(out_path)[0] + ".mid"
 
-            drum_hits=drum_hits,
+            with open(midi_path, "wb") as f:
+                f.write(midi_data)
 
-            beat_times=beat_times,
+            print(
+                "MIDI 寫入完成："
+                f"主唱 {len(melody_notes)}、Bass {len(bass_notes)}、"
+                f"Other {len(other_notes)}、鼓點 {len(drum_hits)}、"
+                f"和弦 Marker {len(chords) if chords else 0}"
+            )
 
-            tps=args.tps,
-
-            song_name=song_name,
-
-            song_author="mp3_to_nbs",
-
-            original_author="",
-
-            description=(
-                "Demucs 4-Stem "
-                "vocals+bass+other+drums"
-                + (
-                    ""
-                    if args.instrument_preset == "legacy"
-                    else f" [preset={args.instrument_preset}]"
+            if chords:
+                print(
+                    "和弦進行："
+                    + _format_chord_chart(chords)
                 )
-            ),
 
-            song_duration=(
-                len(y_other) / args.sr
-            ),
+        # NBS（--format nbs / both）；--format nbs（預設）時
+        # 行為與舊版完全相同，midi 模式完全跳過此區塊。
+        if args.format in ("nbs", "both"):
+            # ====================================================
+            # NBS
+            # ====================================================
 
-            max_tick_shift=(
-                args.max_tick_shift
-            ),
+            print()
+            print(
+                "封裝 NBS ..."
+            )
 
-            other_retrigger_sec=(
-                args.other_retrigger_sec
-            ),
+            data = build_nbs_bytes(
+                melody_notes=melody_notes,
 
-            inst_map=instrument_map,
+                bass_notes=bass_notes,
 
-            layer_panning=layer_panning,
+                other_notes=other_notes,
 
-            piano_notes=piano_notes,
+                chords=chords,
 
-            guitar_notes=guitar_notes,
+                drum_hits=drum_hits,
 
-            range_fit=args.range_fit,
+                beat_times=beat_times,
 
-            melody_double=args.melody_double,
+                tps=args.tps,
 
-            octave_bias={
-                "melody": args.melody_octave_shift,
-                "bass": args.bass_octave_shift,
-                "other": args.other_octave_shift,
-            },
+                song_name=song_name,
 
-            trim_silence=args.trim_silence,
+                song_author="mp3_to_nbs",
 
-            trim_edge_gap=args.trim_edge_gap,
+                original_author="",
 
-            chord_pattern=args.chord_pattern,
+                description=(
+                    "Demucs 4-Stem "
+                    "vocals+bass+other+drums"
+                    + (
+                        ""
+                        if args.instrument_preset == "legacy"
+                        else f" [preset={args.instrument_preset}]"
+                    )
+                ),
 
-            chord_polish=args.chord_polish,
-        )
+                song_duration=(
+                    len(y_other) / args.sr
+                ),
 
-        print(
-            "寫入 NBS ..."
-        )
+                max_tick_shift=(
+                    args.max_tick_shift
+                ),
 
-        with open(
-            out_path,
-            "wb",
-        ) as f:
+                other_retrigger_sec=(
+                    args.other_retrigger_sec
+                ),
 
-            f.write(data)
+                inst_map=instrument_map,
 
-        print(
-            "NBS 寫入完成"
-        )
+                layer_panning=layer_panning,
+
+                piano_notes=piano_notes,
+
+                guitar_notes=guitar_notes,
+
+                range_fit=args.range_fit,
+
+                melody_double=args.melody_double,
+
+                octave_bias={
+                    "melody": args.melody_octave_shift,
+                    "bass": args.bass_octave_shift,
+                    "other": args.other_octave_shift,
+                },
+
+                trim_silence=args.trim_silence,
+
+                trim_edge_gap=args.trim_edge_gap,
+
+                chord_pattern=args.chord_pattern,
+
+                chord_polish=args.chord_polish,
+            )
+
+            print(
+                "寫入 NBS ..."
+            )
+
+            with open(
+                out_path,
+                "wb",
+            ) as f:
+
+                f.write(data)
+
+            print(
+                "NBS 寫入完成"
+            )
 
     elapsed = time.perf_counter() - conversion_start
     minutes = int(elapsed // 60)
@@ -7678,9 +8599,14 @@ def main():
     print(
         "完成"
     )
-    print(
-        f"NBS：{out_path}"
-    )
+    if args.format in ("nbs", "both"):
+        print(
+            f"NBS：{out_path}"
+        )
+    if midi_path:
+        print(
+            f"MIDI：{midi_path}"
+        )
     print(
         "================================"
     )
