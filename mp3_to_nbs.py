@@ -3623,11 +3623,21 @@ def apply_melody_key_fix(
         a_txt = (
             f"{_MIDI_NAMES_PC[audio[1]]} {audio[2]}" if audio else "未知"
         )
-        print(
-            f"  旋律調內修正：旋律推測 {_MIDI_NAMES_PC[tonic]} {mode}、"
-            f"人聲 chroma 推測 {a_txt}，兩者音階不一致，略過"
-        )
-        return melody_notes
+        if audio is not None and audio[3] >= min_corr:
+            # 旋律自己估的調性會被轉譜錯誤污染，人聲 chroma 是獨立證據；
+            # chroma 把握夠高時改用它，而不是整個略過。
+            print(
+                f"  旋律調內修正：旋律推測 {_MIDI_NAMES_PC[tonic]} {mode}、"
+                f"人聲 chroma 推測 {a_txt}（r={audio[3]:.2f}），"
+                f"兩者不一致 → 改用人聲 chroma 的調性"
+            )
+            scale, tonic, mode, corr = audio
+        else:
+            print(
+                f"  旋律調內修正：旋律推測 {_MIDI_NAMES_PC[tonic]} {mode}、"
+                f"人聲 chroma 推測 {a_txt}，兩者音階不一致且 chroma 把握不足，略過"
+            )
+            return melody_notes
 
     fixed, st = fix_melody_to_key(
         melody_notes, y_voc, sr, scale, margin=margin, chroma=chroma
@@ -3829,6 +3839,11 @@ def apply_note_dynamics(
         return notes
 
     y = np.asarray(y, dtype=np.float32)
+    if y.ndim == 2:
+        # 立體聲 (channels, samples) 或 (samples, channels) → 單聲道。
+        # 修正：先前傳入 (2, N) 時 total 變成 2，所有音符 RMS 都是 1e-9，
+        # velocity 全部掉到 vmin（Other 因此被壓成固定 36）。
+        y = y.mean(axis=0 if y.shape[0] <= y.shape[1] else 1)
     total = int(y.shape[0])
     n = len(notes)
     rms = np.zeros(n, dtype=np.float64)
@@ -4024,6 +4039,10 @@ def build_nbs_bytes(
     trim_edge_gap=0.0,
     chord_pattern="beat",
     chord_polish=False,
+    drum_volume=1.0,
+    hat_volume=1.0,
+    melody_retrigger_sec=0.0,
+    melody_retrigger_decay=0.85,
 ):
 
     # 音色映射（preset + override 已在 main 解析）。
@@ -4218,6 +4237,27 @@ def build_nbs_bytes(
             key,
             velocity,
         )
+
+        # 主旋律延音：NBS 沒有 note-off，長音敲一次很快就消失。
+        # 對較長的音每 melody_retrigger_sec 秒補敲一次，力度逐次遞減。
+        if melody_retrigger_sec and melody_retrigger_sec > 0:
+            _k = 1
+            _t = start + _k * float(melody_retrigger_sec)
+            while _t <= end - 0.15:
+                add_note(
+                    L_MELODY,
+                    int(round(_t * tps)),
+                    instrument,
+                    key,
+                    _clip(
+                        velocity * (float(melody_retrigger_decay) ** _k),
+                        28,
+                        100,
+                    ),
+                    collision_mode="drop",
+                )
+                _k += 1
+                _t = start + _k * float(melody_retrigger_sec)
 
         # 主唱加厚：同 tick、較小音量的第二音色。
         # 兩個樂器的八度偏移已換算，音高差固定 ±12 半音。
@@ -4629,10 +4669,13 @@ def build_nbs_bytes(
 
         if layer == L_KICK:
             instrument = INSTR["bd"]
+            _drum_scale = float(drum_volume)
         elif layer == L_SNARE:
             instrument = INSTR["snare"]
+            _drum_scale = float(drum_volume)
         else:
             instrument = INSTR["hat"]
+            _drum_scale = float(drum_volume) * float(hat_volume)
 
         add_note(
             layer,
@@ -4640,8 +4683,8 @@ def build_nbs_bytes(
             instrument,
             45,
             _clip(
-                velocity,
-                12,
+                velocity * _drum_scale,
+                8,
                 100,
             ),
             collision_mode="replace_weaker",
@@ -6637,6 +6680,39 @@ def main():
     )
 
     nbs_group.add_argument(
+        "--drum-volume",
+        type=float,
+        default=None,
+        metavar="倍率",
+        help=(
+            "Kick / Snare 音量倍率。未指定時依 preset：legacy=1.0、其餘=0.5"
+            "（鼓與主唱一樣大聲會蓋過伴奏）"
+        ),
+    )
+
+    nbs_group.add_argument(
+        "--hat-volume",
+        type=float,
+        default=None,
+        metavar="倍率",
+        help=(
+            "HiHat 額外音量倍率（再乘上 --drum-volume）。"
+            "未指定時依 preset：legacy=1.0、其餘=0.6；0 = 關閉 hat"
+        ),
+    )
+
+    nbs_group.add_argument(
+        "--melody-retrigger-sec",
+        type=float,
+        default=None,
+        metavar="秒",
+        help=(
+            "主旋律長音延音：每隔這麼多秒補敲一次（力度逐次 ×0.85）。"
+            "0=關閉。未指定時依 preset：legacy=0、其餘=0.4"
+        ),
+    )
+
+    nbs_group.add_argument(
         "--melody-double",
         choices=("off", "low", "high"),
         default="off",
@@ -6901,6 +6977,23 @@ def main():
 
     if args.melody_key_fix is None:
         args.melody_key_fix = args.instrument_preset != "legacy"
+
+    if args.drum_volume is None:
+        args.drum_volume = (
+            1.0 if args.instrument_preset == "legacy" else 0.5
+        )
+    if args.hat_volume is None:
+        args.hat_volume = (
+            1.0 if args.instrument_preset == "legacy" else 0.6
+        )
+    if args.melody_retrigger_sec is None:
+        args.melody_retrigger_sec = (
+            0.0 if args.instrument_preset == "legacy" else 0.4
+        )
+    print(
+        f"鼓音量 x{args.drum_volume:g}（hat 再 x{args.hat_volume:g}），"
+        f"主旋律延音間隔：{args.melody_retrigger_sec:g} 秒"
+    )
 
     if args.chord_pattern is None:
         args.chord_pattern = (
@@ -8327,10 +8420,10 @@ def main():
                 print(
                     f"Guitar 動態力度：{len(guitar_notes)} 個音符"
                 )
-            if other_notes and y_other_st is not None:
+            if other_notes and y_other is not None:
                 other_notes = apply_note_dynamics(
                     other_notes,
-                    y_other_st,
+                    y_other,
                     args.sr,
                     50,
                     95,
@@ -8568,6 +8661,12 @@ def main():
                 chord_pattern=args.chord_pattern,
 
                 chord_polish=args.chord_polish,
+
+                drum_volume=args.drum_volume,
+
+                hat_volume=args.hat_volume,
+
+                melody_retrigger_sec=args.melody_retrigger_sec,
             )
 
             print(
