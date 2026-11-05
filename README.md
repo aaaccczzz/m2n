@@ -1,329 +1,272 @@
-# mp3 to nbs
+# mp3_to_nbs
 
-把 MP3（或任何音訊檔）自動轉成 Minecraft Note Block Studio 的 `.nbs` 多層樂譜。
+把一首 MP3 自動轉成 **Minecraft Note Block Studio（`.nbs`）**，也可以同時輸出 **MIDI（`.mid`）**。
 
-開源、無限制執行的本機轉譜工具。音檔不上傳、不排隊、不限制長度、所有參數都能調。
+流程是：Demucs 分軌 → 各聲部各自轉譜（主唱、Bass、鼓、伴奏、Piano / Guitar）→ 和弦分析與編曲修飾 → 封裝成 NBS / MIDI。
 
----
-
-## 這支程式在做什麼
-
-它不是單純的「格式轉換」，而是把一首混音歌曲拆解、聽寫、重新編成 NBS 多聲部樂譜：
-
-MP3
- └─ Demucs 4-Stem 分離        → vocals / bass / other / drums
- └─ 主唱 RMVPE 音高追蹤        → Melody
- └─ Bass pYIN 音高追蹤         → Bass
- └─ Other 副旋律（多種 backend）→ Other Low / Mid / High
- └─ 和弦分析（可選）           → Chord Root / 3rd / 5th / 7th
- └─ Drums onset 分類           → Kick / Snare / HiHat
- └─ NBS v5 封裝（12 層）
-
-輸出是 NBS v5 格式，直接用 Note Block Studio 開啟即可。
+```
+MP3 ──► Demucs 4-Stem ──► vocals ─► RMVPE 音高追蹤 ─► 主旋律
+                       ├─► bass   ─► pYIN / RMVPE   ─► Bass
+                       ├─► drums  ─► 節拍 / onset    ─► 鼓組重新設計
+                       └─► other  ─► Onsets & Frames ─► 伴奏 + 和弦補缺
+        └─► htdemucs_6s（選用）─► Piano / Guitar 獨立分軌 ─► Onsets & Frames
+                                  ▼
+                 調性 / 和弦 / 音域適配 / 動態力度 / panning
+                                  ▼
+                          .nbs（以及選用的 .mid）
+```
 
 ---
 
 ## 特色
 
-- **本機執行**：音檔不離開你的電腦，沒有上傳、沒有伺服器、沒有隱私問題。
-- **無限制**：不限制歌曲長度、轉檔次數、功能。
-- **開源**：全部程式碼可見、可改。
-- **多 backend**：Other 聲部可選 CQT（傳統訊號處理）或 Onsets & Frames（神經網路）。
-- **參數全開**：主唱音域、Bass 音域、鼓組設計、和弦樣式、八度升降……全部可用 CLI 調整。
-- **持久化快取**：Demucs、HPSS、O&F 推論結果會快取，第二次跑同一首歌快很多。
-- **12 層輸出**：主唱、Bass、Other 低/中/高、和弦四聲部、鼓三件，各自獨立分層。
+- **每個聲部各用最適合的方法**：主唱走 RMVPE、Bass 走 pYIN（可改 RMVPE）、伴奏走 Onsets & Frames 神經網路轉譜。
+- **自動 TPS**：偵測 Tempo 後算出 tick 網格，讓節奏對齊拍點；也可手動指定。
+- **和弦分析**：偵測和弦進行，修正與旋律衝突的和弦、產生和弦伴奏，並可輸出為 MIDI Marker。
+- **動態力度**：依各 stem 的音訊能量重寫每個音符的 velocity，不是固定音量。
+- **立體聲 panning**：依 stem 的立體聲能量估算各 layer 的 pan。
+- **音域適配**：把各樂器折進遊戲內 2 個八度（key 33–57），並換算各樂器的八度偏移。
+- **主旋律修飾**：八度校正、音域自動歸位、調內修正（修轉譜的 ±1 半音誤差）、長音延音補敲。
+- **快取**：同一首歌第二次跑會跳過 Demucs / HPSS / O&F 推理，方便反覆調參。
+- **MIDI 輸出**：標準 SMF Type 1，主唱 / Bass / Piano / Guitar / Other / 鼓各一軌，另有和弦 Marker 軌。
+- **只分軌模式**：`--separate-only` 只輸出 4 軌 WAV，不轉譜。
 
 ---
 
-## 安裝
+## 需求
 
-### 需求
+- Python 3.10 以上（作者環境為 Python 3.13 / Windows）
+- 建議有 NVIDIA GPU（Demucs 與 RMVPE 用）。沒有 GPU 也能跑，只是慢很多。
 
-- Python 3.10+（建議 3.13）
-- ffmpeg（Demucs 需要）
-- 建議有 NVIDIA GPU（Demucs 與 RMVPE 會快很多，CPU 也可跑但慢）
+### Python 套件
 
-### 系統需求建議
+腳本直接 import 的有：
 
-- CPU：4 核心以上
-- RAM：16 GB 以上（Demucs 與 librosa 都很吃記憶體）
-- GPU：NVIDIA，VRAM 6 GB 以上可跑 htdemucs；8 GB 以上較順
-- 硬碟：至少 5 GB 空間（模型 + 快取）
+| 套件 | 用途 |
+|---|---|
+| `numpy`、`scipy`、`librosa`、`soundfile` | 音訊處理、HPSS、pYIN、chroma |
+| `torch`、`demucs` | Demucs 分軌（`demucs.api.Separator`） |
+| `rmvpe_onnx` | 主唱 RMVPE 音高追蹤（ONNX） |
+| `onsets_frames_to_nbs` | Other / Piano / Guitar 的神經網路轉譜（與腳本同資料夾的模組） |
 
-### 安裝 ffmpeg
+MIDI 與 NBS 的寫入都是純標準庫實作，不需要額外套件。
 
-Windows：
-- 到 ffmpeg 官網下載 build，解壓後把 `bin` 加入 PATH
-- 或用 `winget install ffmpeg`
-- 或 `choco install ffmpeg`
+### 需要放好的檔案
 
-Linux：
-- `sudo apt install ffmpeg`
+```
+mp3_to_nbs.py
+onsets_frames_to_nbs.py          # O&F 轉譜模組
+models/
+  onsets_frames_uni.tflite       # O&F 模型；也可用 --other-neural-model 指定其他路徑
+```
 
-macOS：
-- `brew install ffmpeg`
+> TODO：這裡補上你自己的安裝指令（`pip install ...`）與 `rmvpe_onnx` 的取得方式，我沒有看到這兩個檔案，所以不亂寫。
 
-### 安裝步驟
+### 第一次執行會下載
 
-1. 建立虛擬環境
-
-   python -m venv .venv
-   .venv\Scripts\activate        # Windows
-   source .venv/bin/activate     # Linux / macOS
-
-2. 安裝依賴
-
-   pip install -r requirements.txt
-
-3. 安裝 Demucs
-
-   pip install demucs
-
-4. 安裝 RMVPE ONNX（主唱音高追蹤）
-
-   pip install rmvpe-onnx
-
-5. 安裝 O&F 的 TFLite runtime（Other neural backend 需要）
-
-   pip install ai-edge-litert
-
-`onsets_frames_to_nbs.py` 會自動下載 O&F 模型（`models/onsets_frames_uni.tflite`）到專案目錄，第一次執行需要網路。它也會嘗試尋找 ffmpeg，Windows 上可用 `--ffmpeg` 明確指定路徑。
+- Demucs 模型權重（`htdemucs`；開啟 Piano/Guitar 分軌時還有 `htdemucs_6s`）
+- RMVPE 模型（未指定 `--melody-rmvpe-model` 時使用 `rmvpe` 套件預設）
 
 ---
 
-## 使用方式
+## 快速開始
 
-### 最基本
+```bash
+# 最基本：輸出 song.nbs
+python mp3_to_nbs.py song.mp3 -o song.nbs
 
-   python mp3_to_nbs.py input.mp3
+# 同時輸出 NBS 與 MIDI
+python mp3_to_nbs.py song.mp3 -o song.nbs --format both
 
-會在 `input.mp3` 旁邊產生 `input.nbs`。
+# 只分軌，不轉譜
+python mp3_to_nbs.py song.mp3 --separate-only -o stems_out --separate-instrumental
+```
 
-### 指定輸出
+Windows 上若中文路徑或 log 亂碼，請加 `-X utf8`：
 
-   python mp3_to_nbs.py input.mp3 -o output.nbs
+```bash
+python -X utf8 mp3_to_nbs.py "歌名.mp3" -o "歌名.nbs"
+```
 
-### 啟用和弦伴奏（預設關閉）
-
-   python mp3_to_nbs.py input.mp3 --enable-chord-analysis
-
-未啟用時，`hybrid` / `chord` / `mix` 模式會自動退化為 `extract`。
-
-### 常用範例
-
-   # 使用 GPU
-   python mp3_to_nbs.py input.mp3 --device cuda
-
-   # 主唱高一個八度
-   python mp3_to_nbs.py input.mp3 --melody-octave-shift 1
-
-   # 鋼琴主導的曲子
-   python mp3_to_nbs.py input.mp3 --other-preset piano
-
-   # 純音樂，不要和弦生成，只抓實際音符
-   python mp3_to_nbs.py input.mp3 --other-mode extract
-
-   # 關閉 Rap 自適應（A/B 測試用）
-   python mp3_to_nbs.py input.mp3 --no-rap_revise
-
-   # 用 CQT 取代神經網路抓 Other
-   python mp3_to_nbs.py input.mp3 --other-extract-backend cqt
+不指定 `--instrument-preset` 時等同 `pop`，會自動開啟下表中的大部分功能。
 
 ---
 
-## 輸出結構
+## 常用參數
 
-NBS 使用 12 個 layer：
+完整清單請用 `python mp3_to_nbs.py --help` 查看，下面只列最常調的。
 
-| Layer | 名稱 | 來源 |
+### 整體
+
+| 參數 | 說明 |
+|---|---|
+| `-o` | 輸出路徑。MIDI 模式會自動換成 `.mid` |
+| `--format {nbs,midi,both}` | 輸出格式（預設 `nbs`） |
+| `--tps N` | 固定每秒 tick 數。**不指定**則依 Tempo 自動計算；指定會關閉自動 TPS（例如 `--tps 100` 可得到 10 ms 的時間解析度） |
+| `--device cuda\|cpu` | Demucs 運算裝置 |
+| `--seed N` | 隨機種子，控制鼓點音量與副旋律抖動；同一個種子可重現（預設 0） |
+| `--keep-temp` | 保留 Demucs 輸出 |
+
+### 音色
+
+| 參數 | 說明 |
+|---|---|
+| `--instrument-preset` | `pop`（預設）、`rock`、`synth`、`orchestra`、`legacy` |
+| `--melody-instrument`、`--bass-instrument` … | 個別覆蓋 preset；`--melody-instrument auto` 會依音域自動選（高音域 bell、其餘 flute） |
+| `--melody-double {off,low,high}` | 主唱加厚：另開一層較小音量的第二音色 |
+
+各 preset 的主要音色：
+
+| preset | 主旋律 | Other 低 / 中 / 高 | 和弦 |
+|---|---|---|---|
+| `pop` | flute | guitar / harp / pling | harp |
+| `rock` | flute | guitar / guitar / pling | guitar |
+| `synth` | bit | iron_xylophone / pling / bit | pling |
+| `orchestra` | flute | harp / chime / bell | chime |
+| `legacy` | flute | guitar / harp / harp | guitar |
+
+### 力度與混音平衡
+
+| 參數 | 說明 |
+|---|---|
+| `--dynamics {off,melody,bass,both,all}` | 依音訊能量重寫 velocity。`all` = 主唱 + Bass + Piano / Guitar / Other |
+| `--drum-volume 倍率` | Kick / Snare 音量倍率（非 legacy 預設 0.5） |
+| `--hat-volume 倍率` | HiHat 額外倍率，再乘上 `--drum-volume`（非 legacy 預設 0.6；`0` 關閉 hat） |
+| `--panning {off,layer}` | 依立體聲能量估算 panning |
+| `--melody-retrigger-sec 秒` | 主旋律長音每隔幾秒補敲一次（非 legacy 預設 0.4；`0` 關閉） |
+| `--other-retrigger-sec 秒` | 伴奏長音補敲間隔（非 legacy 預設 0.5） |
+
+### 主旋律
+
+| 參數 | 說明 |
+|---|---|
+| `--melody-octave-shift N` | 手動整體升降八度（可與自動音域歸位疊加） |
+| `--melody-min-note-ms` | 短於此毫秒數的人聲音符會被吸附進鄰近長音，抑制滑音碎片（預設 70） |
+| `--rap_revise` / `--no-rap_revise` | Rap / 快速人聲修正（預設開） |
+| `--melody-key-fix` / `--no-melody-key-fix` | 調內修正 |
+| `--melody-key-fix-margin 倍數` | 調內修正門檻，越大越保守（預設 1.25） |
+| `--no-octave-correction` | 關閉主唱八度校正 |
+
+### 伴奏（Other / Piano / Guitar）
+
+| 參數 | 說明 |
+|---|---|
+| `--other-mode {hybrid,chord,extract,mix}` | 預設 `hybrid`：優先用實際抓到的音，不足處用和弦補缺 |
+| `--other-extract-backend {cqt,neural}` | 預設 `neural`（Onsets & Frames） |
+| `--other-neural-engine {auto,tflite,gpu}` | `auto` 優先 WebGPU，不行再退回 tflite CPU |
+| `--other-neural-raw` | 跳過 HPSS 與 spectral gate，直接用 Demucs 的 other.wav |
+| `--split-piano-guitar` / `--no-split-piano-guitar` | 用 `htdemucs_6s` 另外分出 Piano / Guitar（非 legacy 預設開） |
+| `--other-neural-max-polyphony N` | 同一 onset 群組最多保留幾個同時音符（預設 4） |
+
+### 輸出整理
+
+| 參數 | 說明 |
+|---|---|
+| `--trim-silence` | 剃除前後空白（非 legacy 預設開） |
+| `--trim-edge-gap 秒` | 頭尾與主體相隔超過這麼多秒的孤立音視為雜音並移除（預設 0 = 不移除，建議 5） |
+| `--range-fit` | 音域適配，把音符折進 key 33–57 |
+| `--max-tick-shift N` | 同 layer 同 tick 撞音時最多往後找幾個 tick（預設 4） |
+| `--chord-pattern {beat,bar,arp}` | 和弦伴奏敲法 |
+| `--chord-polish` | 把 sus / 七和弦改成調內三和弦，並避開與旋律差半音的和弦音 |
+
+---
+
+## preset 與預設值
+
+`--instrument-preset legacy` 會維持加入 preset 之前的舊行為，輸出保持與舊版一致。其他 preset（預設 `pop`）會自動開啟下列功能，除非你個別關掉：
+
+| 功能 | `legacy` | 其他 preset |
 |---|---|---|
-| 0 | Melody | 主唱 RMVPE |
-| 1 | Bass | Bass pYIN + 和弦根音 |
-| 2 | Other Low | Other MIDI < 55 |
-| 3 | Other Mid | Other MIDI 55–75 |
-| 4 | Other High | Other MIDI ≥ 76 |
-| 5 | Chord Root | 和弦根音 |
-| 6 | Chord 3rd | 和弦三度 |
-| 7 | Chord 5th | 和弦五度 |
-| 8 | Chord 7th | 和弦七度 |
-| 9 | Kick | Drums onset 分類 |
-| 10 | Snare | Drums onset 分類 |
-| 11 | HiHat | Drums onset 分類 |
-
-MIDI → NBS key 採標準映射：`key 0 = MIDI 21 (A0)`、`key 87 = MIDI 108 (C8)`。
+| 動態力度 `--dynamics` | off | all |
+| 立體聲 panning | off | layer |
+| Piano/Guitar 分軌 | off | on |
+| 音域適配 `--range-fit` | off | on |
+| 主唱音域自動歸位 | off | auto |
+| 和弦分析 | off | on |
+| 和弦配對檢查 | off | auto |
+| 和弦優化 `--chord-polish` | off | on |
+| 旋律調內修正 | off | on |
+| 剃除前後空白 | off | on |
+| 和弦伴奏敲法 | beat | bar |
+| 鼓音量 / hat 音量 | 1.0 / 1.0 | 0.5 / 0.6 |
+| 主旋律延音間隔 | 0（關） | 0.4 秒 |
+| Other 延音間隔 | 0（關） | 0.5 秒 |
 
 ---
 
-## Other 模式
+## 輸出的 NBS layer
 
-`--other-mode` 控制副旋律怎麼產生：
-
-| 模式 | 行為 |
+| Layer | 內容 |
 |---|---|
-| `hybrid`（預設） | 優先使用 Other 實際抓到的音符，不足處用和弦補齊 |
-| `chord` | 完全用和弦 + 節拍生成琶音伴奏（穩定但機械） |
-| `extract` | 逐幀從 Other 抓音符（CQT 或 neural） |
-| `mix` | 有人聲用 chord、無人聲用 extract，依 vocals 能量自動切換 |
+| 0 | 主旋律 |
+| 1 | Bass |
+| 2 / 3 / 4 | Other 低 / 中 / 高音域 |
+| 5 / 6 / 7 / 8 | 和弦伴奏（根音 / 三音 / 五音 / 七音） |
+| 9 / 10 / 11 | Kick / Snare / HiHat |
+| 12–15 | Piano（4 個音域帶，分界 key 48 / 60 / 72） |
+| 16–19 | Guitar（4 個音域帶） |
+| 20 | 主唱加厚層（`--melody-double`） |
 
-`--other-extract-backend` 控制 extract 的引擎：
+沒有啟用的功能不會產生對應 layer 的音符。
 
-| Backend | 說明 |
+---
+
+## 快取
+
+腳本旁會建立 `.mp3_nbs_cache/`。快取鍵是輸入檔的大小、修改時間與相關參數，因此：
+
+- 同一首歌調參數重跑，可以跳過 Demucs、HPSS、雜音抑制與 O&F 模型推理。
+- 換了 mp3 或影響該階段的參數，會自動重算。
+- 想強制重算時，直接刪掉 `.mp3_nbs_cache/` 即可。
+
+---
+
+## 效能
+
+以一首約 5 分 50 秒的歌為例（log 實測，總計約 9 分 43 秒）：
+
+| 階段 | 約耗時 |
 |---|---|
-| `neural`（預設） | Onsets & Frames TFLite，複音轉譜，準確度較高 |
-| `cqt` | CQT peak picking + 泛音抑制 + track continuity，純訊號處理 |
+| Demucs 分軌（4-stem + 6-stem） | 55 秒 |
+| 載入 stems + HPSS 快取 | 72 秒 |
+| 平行分析（主唱、Bass、純音樂旋律、和弦、鼓） | 254 秒 |
+| Piano / Guitar 的 O&F 轉譜 | 166 秒 |
+| 封裝 NBS / MIDI | 約 4 秒 |
+
+時間大多花在 CPU 密集的 pYIN（Bass 與「純音樂旋律搜尋」）和每個 stem 的 HPSS + 頻譜 gate。想縮短時間：
+
+- 確認 GPU 路徑真的生效（見下方疑難排解）。
+- 反覆調參時盡量重用快取。
+- Bass 可試 `--bass-backend rmvpe`（GPU 上快很多，輸出與 pYIN 略有差異，建議先 A/B 比較）。
+- 不需要 Piano / Guitar 分軌時，用 `--no-split-piano-guitar`。
 
 ---
 
-## 參數總覽
+## 疑難排解
 
-### 基本參數
+**log 說 `device=cuda`，但 RMVPE 實際跑在 CPU**
+看 `RMVPE → 生效 provider` 那一行。若是 `CPUExecutionProvider` 並伴隨 `cublasLt64_13.dll` 找不到，代表 onnxruntime 的 CUDA 版缺少 CUDA 13 / cuDNN 9 執行庫。Demucs 走的是 torch 自己的 CUDA，所以不受影響。
 
-- `mp3`：輸入音訊路徑（必填）
-- `-o`, `--output`：輸出 NBS 路徑，預設與輸入同名的 `.nbs`
-- `--sr`：取樣率，預設 22050
-- `--tps`：每秒 tick 數，預設 40.0
-- `--demucs-model`：Demucs 模型，預設 `htdemucs`
-- `--device`：運算裝置，例如 `cuda` / `cpu`
-- `--segment`：Demucs segment
-- `--keep-temp`：保留 Demucs 輸出
-- `--seed`：隨機種子，控制鼓點音量 / 副旋律抖動的隨機性，預設 0
+**中文檔名或 log 亂碼（Windows）**
+用 `python -X utf8 ...` 執行。
 
-### 音高升降八度
+**音準有些音在調外**
+先看 log 的「旋律調內修正」那幾行，確認推測的調性是否合理。旋律推測的調與人聲 chroma 推測的調不一致時，會印出來；若 chroma 的相關係數 r 不高，結果可信度有限，可用 `--no-melody-key-fix` 關掉，或調高 `--melody-key-fix-margin`。
 
-- `--melody-octave-shift`：主唱升降八度，0=原始 1=高一個八度 2=高兩個八度 -1=低一個八度，預設 0
-- `--bass-octave-shift`：Bass 升降八度，預設 0
-- `--other-octave-shift`：Other 樂器升降八度，預設 0
+**鼓太吵或伴奏太小聲**
+調整 `--drum-volume`、`--hat-volume`；確認 `--dynamics all` 有開。
 
-### 主唱 RMVPE 參數
+**長音聽起來太快消失**
+NBS 沒有 note-off，只能靠重複敲擊。用 `--melody-retrigger-sec` 與 `--other-retrigger-sec` 調整間隔。
 
-- `--melody-fmin`：主唱最低偵測音符，預設 `C2`
-- `--melody-fmax`：主唱最高偵測音符，預設 `C6`
-- `--melody-min-dur`：主唱音符最短保留時間（秒），預設 0.025
-- `--melody-gap-tolerance`：主唱無聲多久才視為斷句（秒），預設 0.09
-- `--melody-voiced-prob`：RMVPE F0 confidence threshold，預設 0.03
-- `--melody-persistence`：RMVPE 新音高至少持續多久才換音，預設 0.045
-- `--melody-medfilt-kernel`：RMVPE MIDI 中值濾波窗口大小，預設 5
-- `--melody-min-note-ms`：人聲音符短於此長度（毫秒）會被吸附進鄰近長音，0 表示關閉，預設 70.0
-- `--rap_revise` / `--no-rap_revise`：啟用 Rap/快速人聲修正，預設開啟
-- `--melody-rmvpe-model`：RMVPE 模型檔路徑，留空使用套件預設模型
-- `--melody-rmvpe-half`：RMVPE 使用 FP16
-- `--no-octave-correction`：關閉主唱八度校正，預設開啟校正
-
-### Bass pYIN 參數
-
-- `--bass-fmin`：Bass 最低偵測音符，預設 `E1`
-- `--bass-fmax`：Bass 最高偵測音符，預設 `C4`
-- `--bass-frame-length`：Bass pYIN frame_length，預設 2048
-- `--bass-hop-length`：Bass pYIN hop_length，預設 256
-- `--bass-min-dur`：Bass 音符最短保留時間（秒），預設 0.05
-- `--bass-gap-tolerance`：Bass 無聲多久才視為斷句（秒），預設 0.08
-- `--bass-voiced-prob`：Bass 有聲判定機率門檻，預設 0.12
-- `--bass-persistence`：Bass 新音高要持續多久（秒）才算換音，預設 0.03
-- `--bass-medfilt-kernel`：Bass 音高中值濾波窗口大小，預設 3
-
-### 和弦分析參數
-
-- `--enable-chord-analysis`：啟用和弦分析，預設關閉
-- `--other-chord-subdivision`：每個 beat 切成幾個音符，1=每拍一音 2=八分音符琶音 4=十六分音符琶音，預設 2
-- `--other-chord-pattern`：琶音樣式，`up` / `down` / `up_down` / `root_only`，預設 `up`
-- `--other-chord-note-len-ratio`：每個音符實際發聲長度占時間格的比例，預設 0.9
-- `--no-chord-rotation`：關閉琶音方向隨小節交替，預設開啟
-- `--other-chord-skip`：offbeat 音符被跳過的機率，預設 0.08
-- `--other-chord-humanize`：音符時間隨機抖動幅度（秒），預設 0.008
-
-### Other 樂器參數
-
-- `--other-preset`：Other 分析預設，`default` / `piano`，預設 `default`
-- `--other-mode`：副旋律產生方式，`hybrid` / `chord` / `extract` / `mix`，預設 `hybrid`
-- `--other-extract-backend`：Other 實際音符抽取引擎，`cqt` / `neural`，預設 `neural`
-- `--other-neural-model`：Other neural Onsets & Frames 模型路徑，留空使用 `models/onsets_frames_uni.tflite`
-- `--other-neural-onset-threshold`：Other neural onset threshold，預設 0.45
-- `--other-neural-frame-threshold`：Other neural frame threshold，預設 0.40
-- `--other-neural-min-duration`：Other neural 最短音符時間（秒），預設 0.035
-- `--other-neural-min-velocity`：Other neural 最低 velocity，預設 24
-- `--other-neural-midi-min`：Other neural 最低 MIDI 音高，預設 21
-- `--other-neural-midi-max`：Other neural 最高 MIDI 音高，預設 108
-- `--other-neural-max-duration`：Other neural 單顆音符最大長度（秒），預設 8.0
-- `--other-neural-merge-gap`：Other neural 同音符合併間隔（秒），預設 0.03
-- `--other-neural-max-polyphony`：Other neural 同一 onset 群組最多保留幾個同時音符，預設 4
-- `--other-neural-onset-group-window`：Other neural 視為同一 onset 群組的時間窗口（秒），預設 0.055
-- `--other-neural-raw`：Other neural 直接使用 Demucs other.wav，跳過 HPSS 與 spectral gate
-- `--other-hop-length`：[extract 模式] Other CQT hop_length，預設 256
-- `--other-min-note-dur`：[extract 模式] Other 音符最短保留時間（秒），預設 0.08
-- `--other-energy-threshold`：[extract 模式] Other 音符能量門檻，預設 0.2
-- `--other-min-note-separation`：[extract 模式] Other 音符之間最短間隔（秒），預設 0.12
-- `--other-max-notes-per-frame`：[extract 模式] 每個 CQT frame 最多保留幾個音高峰，預設 1
-- `--other-peak-min-separation`：[extract 模式] 不同 CQT 峰之間至少相差多少半音，預設 2
-- `--other-harmonic-tolerance`：[extract 模式] 泛音匹配容許誤差（半音），預設 0.45
-- `--other-harmonic-count`：[extract 模式] 每個候選基頻最多檢查幾階泛音，預設 8
-- `--other-harmonic-suppression`：[extract 模式] 泛音候選最高抑制比例，預設 0.65
-- `--other-track-max-gap`：[extract 模式] 多音符 track 允許短暫掉音多久（秒），預設 0.06
-- `--other-cqt-fmin`：[extract 模式] CQT 最低音，預設 `C2`
-- `--other-cqt-fmax`：[extract 模式] CQT 最高音，預設 `C8`
-- `--other-no-filter`：[extract/mix] 關閉 Other 的時間稀疏化與音符過濾
-- `--other-confidence-threshold`：[extract/hybrid] Other 音符最低可信度，預設 0.18
-
-### NBS 輸出參數
-
-- `--other-retrigger-sec`：Other 長音在 NBS 中重新觸發的間隔（秒），0=不人工重敲，預設 0.0
-- `--max-tick-shift`：同一 layer 同一 tick 撞到其他音符時，最多往後找幾個 tick 的空位，預設 4
+**尾段內容很少**
+可能是 mp3 本身較短，或加了 `--trim-edge-gap` 把尾段孤立音移除。先確認音檔長度與參數。
 
 ---
 
-## 快取機制
+## 已知限制
 
-程式會在專案目錄下建立 `.mp3_nbs_cache/`：
-
-.mp3_nbs_cache/
- ├─ demucs/          Demucs 4-stem 輸出
- ├─ hpss/            Other 的 harmonic 快取
- ├─ neural_clean/    O&F 前的降噪結果
- └─ neural_notes/    O&F 模型推論結果
-
-快取 key 由「檔案路徑 + size + mtime_ns + 相關參數」組成。
-同一首歌第二次跑會直接命中快取，跳過 Demucs / HPSS / O&F 推論。
-
-改了參數（例如 `--other-neural-onset-threshold`）會產生新的 key，不會拿到舊結果。若要強制重算，直接刪掉 `.mp3_nbs_cache/` 即可。
-
----
-
-## 獨立執行 O&F 模組
-
-`onsets_frames_to_nbs.py` 也可以單獨使用：
-
-   python onsets_frames_to_nbs.py input.wav -o output.nbs
-
-參數：
-
-- `--model`：自訂模型路徑
-- `--ffmpeg`：ffmpeg.exe 路徑
-- `--tempo`：每秒 tick，預設 20
-- `--onset-threshold`
-- `--frame-threshold`
-- `--min-duration`
-- `--keep-wav`：保留轉出的 16 kHz WAV
-
----
-
-## 常見問題
-
-**Q：一定要 GPU 嗎？**
-不一定。CPU 可以跑，但 Demucs 與 RMVPE 會慢很多。有 NVIDIA GPU 時加 `--device cuda`。
-
-**Q：為什麼我的 NBS 聽起來像機械伴奏？**
-檢查是否用了 `--other-mode chord`。預設 `hybrid` 會優先使用實際抓到的音符，`chord` 才是純生成。若未啟用 `--enable-chord-analysis`，`hybrid` / `chord` / `mix` 都會退化為 `extract`。
-
-**Q：主唱音高抓錯八度怎麼辦？**
-預設會用前後文自動修正。若仍不滿意，可手動加 `--melody-octave-shift 1` 或 `-1`。
-
-**Q：Rap 的短音節被吃掉怎麼辦？**
-預設 `--rap_revise` 已開啟。若想 A/B 比較，用 `--no-rap_revise` 關閉。
-
-**Q：Other 抓不到東西？**
-試試 `--other-preset piano`（高密度、低門檻、多音符），或改用 `--other-extract-backend cqt`。
-
-**Q：轉檔失敗，找不到 RMVPE？**
-執行 `pip install rmvpe-onnx`。若仍失敗，確認 Python 版本與 onnxruntime 相容。
-
-**Q：找不到 ffmpeg？**
-`onsets_frames_to_nbs.py` 會自動搜尋常見路徑。若都找不到，用 `--ffmpeg` 指定，或把 ffmpeg 加進 PATH。
+- 轉譜是自動的，沒有人工校正，伴奏的音符與和弦難免有錯。
+- NBS 的 tick 解析度、單一 layer 單一 tick 只能放一個音，高密度的和弦與快速音型會被折疊或取捨。
+- 調性、和弦與八度的判斷都是推測，結果會因歌曲而異。
+- 只在 Windows + NVIDIA GPU 環境驗證過；其他平台未測試。
