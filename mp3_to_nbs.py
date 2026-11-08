@@ -103,6 +103,176 @@ def _ensure_cache_dir(name):
     return path
 
 
+# =========================================================
+# 加速：與原本結果相同、但更快的 HPSS / 純音樂 pYIN
+# =========================================================
+_HPSS_MEMO = {}
+_HPSS_MEMO_MAX = 4
+
+
+def _median_last_axis(S, k, rows=64):
+    """沿最後一軸做 size=k（奇數）的中值濾波。
+
+    與 scipy.ndimage.median_filter(size=(…,k), mode="reflect") 逐位元相同
+    （奇數視窗的中值就是排序後第 k//2 個元素；reflect 等於 numpy 的 symmetric），
+    但用 partition，約快 4~5 倍。
+    """
+    from numpy.lib.stride_tricks import sliding_window_view
+
+    pad = k // 2
+    out = np.empty_like(S)
+    for i in range(0, S.shape[0], rows):
+        blk = np.pad(S[i:i + rows], ((0, 0), (pad, pad)), mode="symmetric")
+        win = sliding_window_view(blk, k, axis=1)
+        out[i:i + rows] = np.partition(win, pad, axis=-1)[..., pad]
+    return out
+
+
+def _hpss_key(y, margin, n_fft, hop_length, kernel_size, power):
+    a = np.ascontiguousarray(y)
+    h = hashlib.blake2b(a.tobytes(), digest_size=16).hexdigest()
+    return (h, a.dtype.str, a.shape, tuple(np.atleast_1d(margin).tolist()),
+            n_fft, hop_length, kernel_size, power)
+
+
+def _hpss_memo_put(y, margin, harm, n_fft=2048, hop_length=None,
+                   kernel_size=31, power=2.0):
+    if hop_length is None:
+        hop_length = n_fft // 4
+    key = _hpss_key(y, margin, n_fft, hop_length, kernel_size, power)
+    _HPSS_MEMO[key] = np.asarray(harm)
+    while len(_HPSS_MEMO) > _HPSS_MEMO_MAX:
+        _HPSS_MEMO.pop(next(iter(_HPSS_MEMO)))
+
+
+def fast_hpss_harmonic(y, margin=(1.0, 3.0), n_fft=2048, hop_length=None,
+                       kernel_size=31, power=2.0, memo=True):
+    """只回傳 harmonic 的 librosa.effects.hpss，結果逐位元相同，但更快。
+
+    1. 中值濾波改用 partition 版本（逐位元相同）。
+    2. 不計算 percussive 的 mask 與 istft（呼叫端都是丟掉的）。
+    3. 同一段音訊、同參數只算一次（Other 的 harmonic stem 與
+       neural 雜音抑制原本各算一次）。
+    """
+    import librosa
+
+    if hop_length is None:
+        hop_length = n_fft // 4
+    y = np.asarray(y)
+    key = None
+    if memo:
+        key = _hpss_key(y, margin, n_fft, hop_length, kernel_size, power)
+        hit = _HPSS_MEMO.get(key)
+        if hit is not None:
+            return hit.copy()
+
+    S = librosa.stft(y, n_fft=n_fft, hop_length=hop_length)
+    mag, phase = librosa.magphase(S)
+    harm = _median_last_axis(mag, kernel_size)
+    perc = _median_last_axis(np.ascontiguousarray(mag.T), kernel_size).T
+    mh, mp = margin if isinstance(margin, (tuple, list)) else (margin, margin)
+    mask_harm = librosa.util.softmask(
+        harm, perc * mh, power=power, split_zeros=(mh == 1 and mp == 1)
+    )
+    out = librosa.istft(
+        (mag * mask_harm) * phase,
+        dtype=y.dtype, n_fft=n_fft, hop_length=hop_length, length=y.shape[-1],
+    )
+    if memo:
+        _HPSS_MEMO[key] = out
+        while len(_HPSS_MEMO) > _HPSS_MEMO_MAX:
+            _HPSS_MEMO.pop(next(iter(_HPSS_MEMO)))
+        return out.copy()
+    return out
+
+
+def _pyin_instrumental_gated(y_harm, y_vocal, sr, fmin, fmax, hop_length,
+                             pad_sec=1.0):
+    """純音樂旋律用的 pYIN：只在「可能被採用」的區段計算。
+
+    extract_instrumental_melody 最後只採用 vocals 夠小聲（<= -32 dB）且
+    Other 夠大聲（>= -30 dB）的 frame，其餘 frame 的 pYIN 結果都會被丟掉。
+    這裡先用便宜的 RMS 找出這些區段，前後各多算 pad_sec 秒當上下文
+    （讓 Viterbi 與後面的中值平滑在區段邊緣看到真實鄰居），只對這些區段跑 pYIN。
+    區段內的結果與整首跑幾乎相同；若候選區段占了大部分，就直接整首跑。
+    """
+    import librosa
+
+    n = len(y_harm)
+    n_frames = 1 + n // hop_length
+    fmin_hz = float(librosa.note_to_hz(fmin)) if isinstance(fmin, str) else fmin
+    fmax_hz = float(librosa.note_to_hz(fmax)) if isinstance(fmax, str) else fmax
+
+    def _full():
+        return librosa.pyin(
+            y_harm, sr=sr, fmin=fmin_hz, fmax=fmax_hz,
+            frame_length=2048, hop_length=hop_length, fill_na=np.nan,
+        )
+
+    try:
+        times = librosa.frames_to_time(
+            np.arange(n_frames), sr=sr, hop_length=hop_length
+        )
+        v_rms = librosa.feature.rms(
+            y=y_vocal, frame_length=2048, hop_length=hop_length
+        )[0]
+        if len(v_rms) == 0:
+            v_db = np.full(n_frames, -80.0)
+        else:
+            v_db = np.interp(
+                times,
+                librosa.times_like(v_rms, sr=sr, hop_length=hop_length),
+                librosa.amplitude_to_db(v_rms + 1e-8, ref=1.0),
+                left=-80.0, right=-80.0,
+            )
+        o_rms = librosa.feature.rms(
+            y=y_harm, frame_length=2048, hop_length=hop_length
+        )[0]
+        o_db = np.interp(
+            times,
+            librosa.times_like(o_rms, sr=sr, hop_length=hop_length),
+            librosa.amplitude_to_db(o_rms + 1e-8, ref=1.0),
+            left=-80.0, right=-80.0,
+        )
+        gate = (v_db <= -32.0) & (o_db >= -30.0)
+        pad = max(1, int(round(pad_sec * sr / hop_length)))
+        need = np.convolve(
+            gate.astype(np.int32), np.ones(2 * pad + 1, dtype=np.int32), "same"
+        ) > 0
+        if need.mean() > 0.6 or not gate.any():
+            if not gate.any():
+                f0 = np.full(n_frames, np.nan)
+                return f0, np.zeros(n_frames, dtype=bool), np.zeros(n_frames)
+            return _full()
+
+        f0 = np.full(n_frames, np.nan)
+        vflag = np.zeros(n_frames, dtype=bool)
+        vprob = np.zeros(n_frames)
+        edges = np.diff(np.r_[0, need.astype(np.int8), 0])
+        starts = np.flatnonzero(edges == 1)
+        ends = np.flatnonzero(edges == -1)  # 不含
+        for a, b in zip(starts, ends):
+            seg = y_harm[a * hop_length: min(n, (b - 1) * hop_length + 1)]
+            if len(seg) < 2048:
+                return _full()
+            f, vf, vp = librosa.pyin(
+                seg, sr=sr, fmin=fmin_hz, fmax=fmax_hz,
+                frame_length=2048, hop_length=hop_length, fill_na=np.nan,
+            )
+            m = min(len(f), b - a)
+            f0[a:a + m] = f[:m]
+            vflag[a:a + m] = vf[:m]
+            vprob[a:a + m] = vp[:m]
+        print(
+            f"  純音樂 pYIN：只計算 {need.mean() * 100:.0f}% 的 frame（其餘不會被採用）"
+        )
+        return f0, vflag, vprob
+    except Exception as exc:  # 任何意外都退回原本的整首計算
+        print(f"  純音樂 pYIN 區段加速失敗，改整首計算：{exc}")
+        return _full()
+
+
+
 def _torch_cuda_available():
     """torch + CUDA 是否可用（只做偵測，不 import 大型子模組）。"""
     try:
@@ -215,6 +385,9 @@ OTHER_OCTAVE_SHIFT = 0
 
 # Other 相對主唱的基準音量。預設稍微壓低，避免伴奏蓋過主唱。
 OTHER_VELOCITY_SCALE = 0.72
+
+
+
 
 
 # ============================================================
@@ -1396,7 +1569,7 @@ def extract_other_notes(
     )
 
     if y_harm is None:
-        y_harm, _ = librosa.effects.hpss(
+        y_harm = fast_hpss_harmonic(
             y_other,
             margin=(1.0, 3.0),
         )
@@ -2534,7 +2707,7 @@ def clean_other_for_neural(
     print("  Other(neural) → 雜音抑制 ...")
 
     # 先取 harmonic；margin 越偏向 harmonic，鼓與短促瞬態越容易被壓掉。
-    harmonic, _ = librosa.effects.hpss(
+    harmonic = fast_hpss_harmonic(
         y,
         margin=(1.0, 3.0),
     )
@@ -3323,6 +3496,84 @@ LAYER_NAMES = {
 
 
 # ============================================================
+# 混音清理（mix cleanup）—— 解決「伴奏很亂很吵」
+# ============================================================
+# 實測數據（雨愛.nbs）：259 秒塞 5,574 個音符、伴奏佔 66.7%，
+# 單一 tick 最多 13 音同時響、603 處「同一 tick 撞同一個音」
+# （最誇張同一音疊 5 次），Piano 與 Guitar 音域幾乎完全重疊。
+# 這裡的六項修正全部是「封裝前的後處理」，不動轉譯演算法：
+#
+#   1. 同一 tick 同一音（跨層）去重，只保留最強的來源
+#   2. 伴奏源二選一（Piano / Guitar 只留一個），
+#      有真實分軌音時關閉機器生成的和弦層（Chord Root/3rd/5th）
+#   3. 層音量分級：伴奏層明顯低於主唱層（velocity 之外的
+#      layer volume，兩者相乘才是實際音量）
+#   4. 編制式 panning：Piano 左、Guitar 右、主唱/Bass 置中
+#   5. 每 tick 伴奏密度上限（超過的丟最弱的）＋ 較嚴格的
+#      Other 抽音門檻（neural onset/frame threshold）
+#   6. 音域展開：Other High 上移一個八度（離開主唱音域、
+#      當高音亮點），和弦下移一個八度（墊在主唱下方）
+#
+# 預設全部關閉（--no-mix-cleanup 即預設行為，輸出與舊版一致）；
+# 明確傳 --mix-cleanup 才整組開啟，仍可用 --no-accomp-source 等
+# 參數（或 legacy preset）個別微調。
+
+# 修正 3：層音量分級（百分比；與音符 velocity 相乘）。
+# 主唱 100，Bass 次之，鼓 / Other / Piano / Guitar 再次，
+# 機器和弦最低。
+MIX_CLEANUP_LAYER_VOLUMES = {
+    L_MELODY: 100,
+    L_MELODY_DOUBLE: 70,
+    L_BASS: 85,
+    L_KICK: 85,
+    L_SNARE: 85,
+    L_HAT: 78,
+    L_OTHER_LOW: 70,
+    L_OTHER_MID: 70,
+    L_OTHER_HIGH: 70,
+    L_CH_ROOT: 60,
+    L_CH_3RD: 60,
+    L_CH_5TH: 60,
+    L_CH_7TH: 60,
+    L_PIANO_BANDS[0]: 65,
+    L_PIANO_BANDS[1]: 65,
+    L_PIANO_BANDS[2]: 62,
+    L_PIANO_BANDS[3]: 60,
+    L_GUITAR_BANDS[0]: 65,
+    L_GUITAR_BANDS[1]: 65,
+    L_GUITAR_BANDS[2]: 62,
+    L_GUITAR_BANDS[3]: 60,
+}
+
+# 修正 4：編制式 panning（NBS 0=極左、100=中央、200=極右）。
+# 主唱 / Bass / Kick 置中；Piano 整組靠左、Guitar 整組靠右；
+# Other 低中高三聲部分散；HiHat 稍微往右（常見鼓組擺位）。
+MIX_CLEANUP_ARRANGEMENT_PANNING = {
+    L_MELODY: 100,
+    L_MELODY_DOUBLE: 100,
+    L_BASS: 100,
+    L_KICK: 100,
+    L_SNARE: 104,
+    L_HAT: 116,
+    L_OTHER_LOW: 80,
+    L_OTHER_MID: 120,
+    L_OTHER_HIGH: 136,
+    L_CH_ROOT: 84,
+    L_CH_3RD: 96,
+    L_CH_5TH: 108,
+    L_CH_7TH: 120,
+    L_PIANO_BANDS[0]: 38,
+    L_PIANO_BANDS[1]: 45,
+    L_PIANO_BANDS[2]: 55,
+    L_PIANO_BANDS[3]: 65,
+    L_GUITAR_BANDS[0]: 135,
+    L_GUITAR_BANDS[1]: 145,
+    L_GUITAR_BANDS[2]: 155,
+    L_GUITAR_BANDS[3]: 162,
+}
+
+
+# ============================================================
 # 音域適配（range fit）
 # ============================================================
 # NBS 的 key 是「相對於樂器」的：key 33~57 是遊戲內的 2 個八度，
@@ -4043,12 +4294,22 @@ def build_nbs_bytes(
     hat_volume=1.0,
     melody_retrigger_sec=0.0,
     melody_retrigger_decay=0.85,
+    mix_cleanup=False,
+    max_accomp_per_tick=3,
+    register_spread=False,
+    layer_volumes=None,
+    chord_backing="on",
 ):
 
     # 音色映射（preset + override 已在 main 解析）。
     # 未指定時等同 legacy：保證舊呼叫端輸出不變。
     if inst_map is None:
         inst_map = dict(INSTRUMENT_PRESETS["legacy"])
+
+    # 混音清理（修正 2）：chord_backing="off" 時不輸出機器和弦層。
+    # "auto" 已在 main 解析成 on/off（有真實 Piano/Guitar 分軌音
+    # 時 off，避免同一個和弦被彈兩遍）。
+    emit_chords = (str(chord_backing) == "on")
 
     notes_by_layer_tick = {}
 
@@ -4350,9 +4611,11 @@ def build_nbs_bytes(
     if range_fit and other_notes:
         _g = {}
         for note in other_notes:
-            _g.setdefault(
-                classify_other_layer(note[2], note[1] - note[0]), []
-            ).append(note[2])
+            _layer = classify_other_layer(note[2], note[1] - note[0])
+            # 修正 6：Other High 上移一個八度（高音亮點，
+            # 離開主唱與 Piano 的音域）。
+            _p = note[2] + (12 if (register_spread and _layer == L_OTHER_HIGH) else 0)
+            _g.setdefault(_layer, []).append(_p)
         for _layer, _p in _g.items():
             if _layer == L_OTHER_LOW:
                 _inst = INSTR[inst_map["other_low"]]
@@ -4444,11 +4707,18 @@ def build_nbs_bytes(
             else:
                 other_instrument = INSTR[inst_map["other_mid"]]
 
+            # 修正 6：Other High 上移一個八度。
+            eff_pitch = (
+                pitch + 12
+                if (register_spread and other_layer == L_OTHER_HIGH)
+                else pitch
+            )
+
             add_note(
                 other_layer,
                 tick,
                 other_instrument,
-                key_of(pitch, other_instrument, other_layer),
+                key_of(eff_pitch, other_instrument, other_layer),
                 velocity,
                 collision_mode="replace_weaker",
             )
@@ -4459,12 +4729,19 @@ def build_nbs_bytes(
 
     # 和弦音固定落在 C4~A5 附近：用均勻音高分佈規劃八度偏移即可。
     _chord_new = chord_polish or chord_pattern != "beat"
+    # 修正 6：和弦下移一個八度（墊在主唱下方，離開主唱音域）。
+    _chord_spread_off = 12 if register_spread else 0
     plan_fit(
         "Chord",
         INSTR[inst_map["chord"]],
-        list(range(CHORD_VOICE_RANGE[0], CHORD_VOICE_RANGE[1] + 1))
-        if _chord_new
-        else list(range(60, 83)),
+        [
+            p - _chord_spread_off
+            for p in (
+                list(range(CHORD_VOICE_RANGE[0], CHORD_VOICE_RANGE[1] + 1))
+                if _chord_new
+                else list(range(60, 83))
+            )
+        ],
     )
 
     # ---- 新版和弦伴奏（chord_polish / chord_pattern != beat）----
@@ -4507,11 +4784,15 @@ def build_nbs_bytes(
             chord_state["k"] = 0
             pcs = [(int(root) + i) % 12 for i in iv]
             if chord_polish:
-                chord_state["voicing"] = choose_voicing(
+                _voicing = choose_voicing(
                     pcs, chord_state["voicing"]
                 )
             else:
-                chord_state["voicing"] = [60 + int(root) + i for i in iv]
+                _voicing = [60 + int(root) + i for i in iv]
+            # 修正 6：和弦整體下移一個八度。
+            if register_spread:
+                _voicing = [p - 12 for p in _voicing]
+            chord_state["voicing"] = _voicing
             if changed:
                 chord_stats["snapped"] += 1
         else:
@@ -4601,7 +4882,12 @@ def build_nbs_bytes(
 
                 # ------------------------------------------------
                 # 和弦
+                # （混音清理修正 2：chord_backing=off 時不輸出機器和弦層；
+                #   Bass 根音仍照常補，只跳過 Root/3rd/5th/7th 四層。）
                 # ------------------------------------------------
+
+                if not emit_chords:
+                    break
 
                 if _chord_new:
                     emit_new_chord(beat, tick, root, quality)
@@ -4638,6 +4924,7 @@ def build_nbs_bytes(
                         60
                         + root
                         + iv
+                        - _chord_spread_off
                     )
 
                     add_note(
@@ -4784,6 +5071,105 @@ def build_nbs_bytes(
                 [],
             ).append(
                 (layer,) + note
+            )
+
+    # ========================================================
+    # 混音清理（mix_cleanup）
+    #
+    # 修正 1：同一 tick 撞同一個音（跨層）只保留一個。
+    #   實測同一 tick 同音最多疊到 5 次（Piano×Guitar×Other×Chord
+    #   各自獨立抓到同一顆音），音量瞬間疊加就是「吵」的主要來源。
+    #   主唱 / Bass / 鼓 / 主唱加厚為保護層，永不刪；
+    #   伴奏層（Other / Chord / Piano / Guitar）只留 velocity
+    #   最強的那一個來源。
+    #
+    # 修正 5a：單一 tick 的伴奏音符數上限。
+    #   超過上限時從最弱的開始丟，避免 13 顆音同時響的音牆。
+    #   兩層都在「封裝前」作用，不影響轉譯演算法本身。
+    # ========================================================
+
+    mix_dedup_removed = 0
+    mix_cap_removed = 0
+    if mix_cleanup and tick_map:
+
+        _protected_layers = {
+            L_MELODY,
+            L_MELODY_DOUBLE,
+            L_BASS,
+            L_KICK,
+            L_SNARE,
+            L_HAT,
+        }
+        _accomp_layers = {
+            L_OTHER_LOW,
+            L_OTHER_MID,
+            L_OTHER_HIGH,
+            L_CH_ROOT,
+            L_CH_3RD,
+            L_CH_5TH,
+            L_CH_7TH,
+            *L_PIANO_BANDS,
+            *L_GUITAR_BANDS,
+        }
+        _cap = max(0, int(max_accomp_per_tick))
+
+        for tick in list(tick_map.keys()):
+            entries = tick_map[tick]
+
+            # ---- 修正 1：跨層同音去重 ----
+            # 用「實際發聲音高」分組：不同樂器的 key 帶八度補償
+            # （guitar -1 八度、bass -2、flute +1），單看 key 會把
+            # guitar 與 harp 的同 key 誤判成同音（實際差一個八度）。
+            by_key = {}
+            for entry in entries:
+                _smidi = (
+                    int(entry[2]) + 21
+                    + 12 * INSTR_OCTAVE.get(int(entry[1]), 0)
+                )
+                by_key.setdefault(_smidi, []).append(entry)
+
+            kept = []
+            for _key, group in by_key.items():
+                prot = [e for e in group if e[0] in _protected_layers]
+                acc = [e for e in group if e[0] not in _protected_layers]
+                kept.extend(prot)
+                if acc:
+                    # 保護層之外只留最強的伴奏來源
+                    #（同 velocity 時依 layer 編號穩定排序）。
+                    acc.sort(key=lambda e: (-int(e[3]), int(e[0])))
+                    kept.append(acc[0])
+                mix_dedup_removed += len(group) - len(prot) - (1 if acc else 0)
+
+            # ---- 修正 5a：每 tick 伴奏密度上限 ----
+            if _cap > 0:
+                acc_kept = [e for e in kept if e[0] in _accomp_layers]
+                if len(acc_kept) > _cap:
+                    survivors = {
+                        id(e)
+                        for e in sorted(
+                            acc_kept,
+                            key=lambda e: (-int(e[3]), int(e[0])),
+                        )[:_cap]
+                    }
+                    before = len(kept)
+                    kept = [
+                        e
+                        for e in kept
+                        if e[0] not in _accomp_layers
+                        or id(e) in survivors
+                    ]
+                    mix_cap_removed += before - len(kept)
+
+            if kept:
+                tick_map[tick] = kept
+            else:
+                del tick_map[tick]
+
+        if mix_dedup_removed or mix_cap_removed:
+            print(
+                f"  混音清理：跨層同 tick 同音去重 {mix_dedup_removed} 個；"
+                f"每 tick 伴奏上限 {max_accomp_per_tick} "
+                f"再移除 {mix_cap_removed} 個"
             )
 
     all_ticks = sorted(
@@ -5021,7 +5407,16 @@ def build_nbs_bytes(
         )
 
         w_u8(0)
-        w_u8(100)
+
+        # 混音清理（修正 3）：層音量分級。layer volume 與音符
+        # velocity 相乘才是實際音量；這裡把伴奏層整體壓低，
+        # 讓主唱即使 velocity 相同也明顯站在前面。
+        w_u8(
+            100
+            if not layer_volumes
+            else _clip(layer_volumes.get(i, 100), 0, 100)
+        )
+
         w_u8(
             100
             if not layer_panning
@@ -5978,11 +6373,98 @@ def main():
 
     instrument_group.add_argument(
         "--panning",
-        choices=("off", "layer"),
+        choices=("off", "layer", "arrangement"),
         default=None,
         help=(
-            "依立體聲能量估算 Other/鼓各 layer 的 panning。"
-            "未指定時依 preset：legacy=off、其餘=layer"
+            "聲道配置。off=全部置中；"
+            "layer=依立體聲能量估算 Other/鼓各 layer 的 panning；"
+            "arrangement=編制式固定擺位（Piano 左、Guitar 右、"
+            "主唱/Bass/Kick 置中、Other 分散）。"
+            "未指定時依 preset：legacy=off、其餘=layer；"
+            "--mix-cleanup 開啟時=arrangement"
+        ),
+    )
+
+    # ========================================================
+    # 混音清理（解決「伴奏很亂很吵」）
+    # ========================================================
+
+    mix_group = ap.add_argument_group(
+        "混音清理（伴奏去亂 / 降吵）"
+    )
+
+    mix_group.add_argument(
+        "--mix-cleanup",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "封裝前的伴奏後處理：同一 tick 同音（跨層）去重，"
+            "只保留最強來源；主唱/Bass/鼓不受影響。"
+            "未指定時=off（預設關閉，需明確傳 --mix-cleanup 開啟）"
+        ),
+    )
+
+    mix_group.add_argument(
+        "--max-accomp-per-tick",
+        type=int,
+        default=3,
+        metavar="個",
+        help=(
+            "單一 tick 內伴奏（Other/Chord/Piano/Guitar）最多幾個音，"
+            "超過的從最弱開始丟。0=不設限"
+            "（預設: %(default)s）"
+        ),
+    )
+
+    mix_group.add_argument(
+        "--accomp-source",
+        choices=("both", "piano", "guitar"),
+        default=None,
+        help=(
+            "伴奏主體來源二選一：Piano 與 Guitar 分軌音域高度重疊"
+            "（實測同 tick 撞音近百次），兩者都開時同一個和弦"
+            "會被彈兩遍。piano=只留 Piano 分軌（沒有 Piano 音時"
+            "自動保留 Guitar）、guitar=只留 Guitar 分軌、"
+            "both=兩者都保留（舊行為）。"
+            "未指定時=both（預設，Piano/Guitar 都保留）"
+        ),
+    )
+
+    mix_group.add_argument(
+        "--chord-backing",
+        choices=("auto", "on", "off"),
+        default=None,
+        help=(
+            "機器生成的和弦層（Chord Root/3rd/5th/7th）。"
+            "auto=有 Piano/Guitar 真實分軌音時自動關閉"
+            "（避免同一個和弦被彈兩遍）、沒有時開啟；"
+            "on=強制開啟（舊行為）；off=強制關閉。"
+            "Bass 根音補音不受此參數影響。"
+            "未指定時依 --mix-cleanup：開啟=auto、關閉（預設）=on"
+        ),
+    )
+
+    mix_group.add_argument(
+        "--layer-volumes",
+        choices=("flat", "balanced"),
+        default=None,
+        help=(
+            "層音量：flat=全部 100（舊行為）；"
+            "balanced=分級（主唱 100、Bass 85、鼓 85/78、"
+            "Other 70、Piano/Guitar 60-65、機器和弦 60）。"
+            "layer volume 與音符 velocity 相乘才是實際音量。"
+            "未指定時依 --mix-cleanup：開啟=balanced、關閉（預設）=flat"
+        ),
+    )
+
+    mix_group.add_argument(
+        "--register-spread",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "音域展開：Other High 上移一個八度（當高音亮點，"
+            "離開主唱音域）、機器和弦下移一個八度（墊在主唱下方）。"
+            "未指定時依 --mix-cleanup：開啟=on、關閉（預設）=off"
         ),
     )
 
@@ -6402,15 +6884,22 @@ def main():
     other_group.add_argument(
         "--other-neural-onset-threshold",
         type=float,
-        default=0.45,
-        help="Other neural onset threshold（預設: %(default)s）",
+        default=None,
+        help=(
+            "Other neural onset threshold。"
+            "未指定時依 --mix-cleanup：關閉（預設）=0.45、"
+            "開啟=0.50（較嚴格，減少模糊 Other 分軌的假音）"
+        ),
     )
 
     other_group.add_argument(
         "--other-neural-frame-threshold",
         type=float,
-        default=0.40,
-        help="Other neural frame threshold（預設: %(default)s）",
+        default=None,
+        help=(
+            "Other neural frame threshold。"
+            "未指定時依 --mix-cleanup：關閉（預設）=0.40、開啟=0.45"
+        ),
     )
 
     other_group.add_argument(
@@ -6518,11 +7007,12 @@ def main():
     other_group.add_argument(
         "--other-energy-threshold",
         type=float,
-        default=0.2,
+        default=None,
         help=(
             "[extract 模式] Other 音符能量門檻，"
-            "越低越容易抓到弱音"
-            "（預設: %(default)s）"
+            "越低越容易抓到弱音。"
+            "未指定時依 --mix-cleanup：關閉（預設）=0.2、開啟=0.3"
+            "（較嚴格，減少殘響/泛音假音）"
         ),
     )
 
@@ -6627,11 +7117,11 @@ def main():
     other_group.add_argument(
         "--other-confidence-threshold",
         type=float,
-        default=0.18,
+        default=None,
         help=(
             "[extract/hybrid] Other 音符最低可信度。"
-            "越高越乾淨，越低越容易保留弱音"
-            "（預設: %(default)s）"
+            "越高越乾淨，越低越容易保留弱音。"
+            "未指定時依 --mix-cleanup：關閉（預設）=0.18、開啟=0.25"
         ),
     )
 
@@ -6920,12 +7410,71 @@ def main():
             else "all"
         )
 
+    # ========================================================
+    # 混音清理：預設關閉（--no-mix-cleanup 為預設行為）。
+    # 未指定時全部走舊行為（伴奏源 both、機器和弦 on、
+    # 層音量 flat、panning=layer、音域不展開、門檻用舊值）；
+    # 明確傳 --mix-cleanup 才整組開啟。
+    # legacy preset 一律維持舊行為（輸出 byte 不變）。
+    # ========================================================
+    _legacy_preset = args.instrument_preset == "legacy"
+
+    if args.mix_cleanup is None:
+        args.mix_cleanup = False
+
+    _cleanup_on = args.mix_cleanup and not _legacy_preset
+
     if args.panning is None:
-        args.panning = (
-            "off"
-            if args.instrument_preset == "legacy"
-            else "layer"
+        if _legacy_preset:
+            args.panning = "off"
+        else:
+            args.panning = "arrangement" if _cleanup_on else "layer"
+
+    if args.accomp_source is None:
+        args.accomp_source = "both"
+
+    if args.chord_backing is None:
+        args.chord_backing = (
+            "auto" if _cleanup_on else "on"
         )
+
+    if args.layer_volumes is None:
+        args.layer_volumes = (
+            "balanced" if _cleanup_on else "flat"
+        )
+
+    if args.register_spread is None:
+        args.register_spread = _cleanup_on
+
+    # 修正 5b：Other 抽音門檻（混音清理關閉時維持舊值，
+    # 確保預設輸出與舊版一致；開啟時才調嚴，
+    # 減少模糊 Other 分軌的假音與碎片）。
+    if args.other_neural_onset_threshold is None:
+        args.other_neural_onset_threshold = (
+            0.50 if _cleanup_on else 0.45
+        )
+    if args.other_neural_frame_threshold is None:
+        args.other_neural_frame_threshold = (
+            0.45 if _cleanup_on else 0.40
+        )
+    if args.other_energy_threshold is None:
+        args.other_energy_threshold = (
+            0.3 if _cleanup_on else 0.2
+        )
+    if args.other_confidence_threshold is None:
+        args.other_confidence_threshold = (
+            0.25 if _cleanup_on else 0.18
+        )
+
+    print(
+        "混音清理："
+        + ("開啟" if args.mix_cleanup else "關閉")
+        + f"（同 tick 去重＋每 tick 伴奏上限 {args.max_accomp_per_tick}），"
+        + f"伴奏源={args.accomp_source}，"
+        + f"機器和弦={args.chord_backing}，"
+        + f"層音量={args.layer_volumes}，"
+        + f"音域展開={'on' if args.register_spread else 'off'}"
+    )
 
     print(
         f"動態力度：{args.dynamics}"
@@ -7364,12 +7913,15 @@ def main():
             print("  Other → 使用持久化 harmonic 快取")
             y_other_harm = np.load(hpss_cache, mmap_mode=None).astype(np.float32, copy=False)
             y_other_perc = None
+            if getattr(y_other, "dtype", None) == np.float32:
+                _hpss_memo_put(y_other, (1.0, 3.0), y_other_harm)
         else:
             print("  Other → 建立 harmonic/percussive 快取 ...")
-            y_other_harm, y_other_perc = librosa.effects.hpss(
+            y_other_harm = fast_hpss_harmonic(
                 y_other,
                 margin=(1.0, 3.0),
             )
+            y_other_perc = None
             np.save(hpss_cache, np.asarray(y_other_harm, dtype=np.float32), allow_pickle=False)
             print("  Other → harmonic/percussive 快取完成")
 
@@ -8116,7 +8668,7 @@ def main():
 
                     y_harm_stem = None
                     if getattr(args, "other_extract_backend", "neural") == "cqt":
-                        y_harm_stem, _h = librosa.effects.hpss(
+                        y_harm_stem = fast_hpss_harmonic(
                             y_stem,
                             margin=(1.0, 3.0),
                         )
@@ -8138,6 +8690,58 @@ def main():
                     print(
                         f"  {label}：{len(stem_notes)} 個音符"
                     )
+
+        # ====================================================
+        # 混音清理（修正 2）：伴奏主體二選一。
+        #
+        # Piano 與 Guitar 分軌的音域高度重疊（實測雨愛：
+        # 兩者都集中在 C4~B4，同 tick 撞同一音近百次），
+        # 同時保留等於同一個和弦被彈兩遍、時間又差一點，
+        # 這是「亂」的主要來源之一。兩者都有音符時只留一個：
+        #   --accomp-source piano  → 留 Piano（預設；神經轉譯
+        #                              較乾淨、音符較少）
+        #   --accomp-source guitar → 留 Guitar
+        #   --accomp-source both   → 舊行為
+        # 只有一邊有音符時，保留有音符的那邊。
+        # ====================================================
+        if (
+            piano_notes
+            and guitar_notes
+            and args.accomp_source != "both"
+        ):
+            if args.accomp_source == "guitar":
+                print(
+                    f"  混音清理：伴奏源二選一 → 保留 Guitar"
+                    f"（捨棄 Piano {len(piano_notes)} 個音符）"
+                )
+                piano_notes = []
+            else:
+                print(
+                    f"  混音清理：伴奏源二選一 → 保留 Piano"
+                    f"（捨棄 Guitar {len(guitar_notes)} 個音符）"
+                )
+                guitar_notes = []
+
+        # ====================================================
+        # 混音清理（修正 2）：機器和弦層 auto 解析。
+        # 有真實 Piano/Guitar 分軌音時，機器生成的 Chord 層
+        # 只會重複彈同樣的和弦 → 自動關閉；沒有時維持開啟。
+        # Bass 根音補音不受影響（build_nbs_bytes 內處理）。
+        # ====================================================
+        if args.chord_backing == "auto":
+            args.chord_backing = (
+                "off"
+                if (piano_notes or guitar_notes)
+                else "on"
+            )
+            print(
+                "  混音清理：機器和弦層 auto → "
+                + (
+                    "關閉（已有 Piano/Guitar 真實分軌音）"
+                    if args.chord_backing == "off"
+                    else "開啟（無真實分軌音）"
+                )
+            )
 
         # ====================================================
         # [7/7] 副旋律（Other）
@@ -8433,7 +9037,25 @@ def main():
                 )
 
         layer_panning = None
-        if args.panning == "layer":
+
+        # 混音清理（修正 4）：編制式固定擺位。
+        # 不再依賴立體聲能量估算（分離出來的 stem 幾乎都
+        # 置中，估出來全部 ~100 等於沒有分離），直接按
+        # 編制擺位：Piano 左、Guitar 右、主唱/Bass/Kick 置中、
+        # Other 低中高三聲部分散。
+        if args.panning == "arrangement":
+
+            layer_panning = dict(MIX_CLEANUP_ARRANGEMENT_PANNING)
+
+            print(
+                "Layer panning（編制式）："
+                + ", ".join(
+                    f"{LAYER_NAMES.get(k, k)}={v}"
+                    for k, v in sorted(layer_panning.items())
+                )
+            )
+
+        elif args.panning == "layer":
 
             pans_by_layer = {}
 
@@ -8667,6 +9289,29 @@ def main():
                 hat_volume=args.hat_volume,
 
                 melody_retrigger_sec=args.melody_retrigger_sec,
+
+                melody_retrigger_decay=0.85,
+
+                # ====================================================
+                # 混音清理（mix cleanup）
+                # ====================================================
+                mix_cleanup=args.mix_cleanup,
+
+                max_accomp_per_tick=(
+                    args.max_accomp_per_tick
+                    if args.mix_cleanup
+                    else 0
+                ),
+
+                register_spread=args.register_spread,
+
+                layer_volumes=(
+                    dict(MIX_CLEANUP_LAYER_VOLUMES)
+                    if args.layer_volumes == "balanced"
+                    else None
+                ),
+
+                chord_backing=args.chord_backing,
             )
 
             print(
@@ -9067,7 +9712,7 @@ def analyze_chords(y_other, sr, hop_length=512, y_harm=None, chord_analysis=True
 
     print("Other 和弦分析 ...")
     if y_harm is None:
-        y_harm, _ = librosa.effects.hpss(y_other, margin=(1.0, 3.0))
+        y_harm = fast_hpss_harmonic(y_other, margin=(1.0, 3.0))
         print("  Other 和弦 → HPSS 完成")
     else:
         print("  Other 和弦 → 使用已快取的 harmonic stem")
@@ -9492,21 +10137,20 @@ def extract_instrumental_melody(
 
     # Other 先取 harmonic，盡量降低殘留鼓聲/瞬態的干擾。
     if y_harm is None:
-        y_harm, _ = librosa.effects.hpss(y_other, margin=(1.0, 3.0))
+        y_harm = fast_hpss_harmonic(y_other, margin=(1.0, 3.0))
         print("  Other 純音樂旋律 → HPSS 完成")
     else:
         print("  Other 純音樂旋律 → 使用已快取的 harmonic stem")
 
     # 用 pYIN 找「可能的主旋律」。這裡不直接整段採用，
     # 後面還會用 vocals 能量把真正的人聲區段排除。
-    f0, voiced_flag, voiced_prob = librosa.pyin(
+    f0, voiced_flag, voiced_prob = _pyin_instrumental_gated(
         y_harm,
-        sr=sr,
-        fmin=librosa.note_to_hz(fmin_note),
-        fmax=librosa.note_to_hz(fmax_note),
-        frame_length=2048,
-        hop_length=hop_length,
-        fill_na=np.nan,
+        y_vocal,
+        sr,
+        fmin_note,
+        fmax_note,
+        hop_length,
     )
 
     times = librosa.times_like(f0, sr=sr, hop_length=hop_length)
