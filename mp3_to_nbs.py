@@ -6752,6 +6752,21 @@ def main():
     )
 
     chord_group.add_argument(
+        "--chord-silence-db",
+        type=float,
+        default=-38.0,
+        metavar="dB",
+        help=(
+            "和弦靜音門檻（預設 -38）。Other 聲部某一段的平均音量低於"
+            "這個值時，視為那裡其實沒有聲音，不產生和弦（修正：原本"
+            "chroma_cqt 會把前奏/間奏/尾奏這類安靜段落的噪音放大成"
+            "看起來很有把握的和弦，導致本該是空的地方被生出聲音）。"
+            "數字越大（例如 -30）判定越嚴格，可能連真正安靜的樂段"
+            "也被當成無聲；數字越小（例如 -50）則越寬鬆。"
+        ),
+    )
+
+    chord_group.add_argument(
         "--other-chord-subdivision",
         type=int,
         default=2,
@@ -8159,6 +8174,7 @@ def main():
         chord_cache_key = _cache_key_for_file(
             stems["other"], "chords-v1", args.sr,
             bool(args.enable_chord_analysis),
+            float(args.chord_silence_db),
         )
         drum_cache_key = _cache_key_for_file(
             stems["drums"], "drums-v1", args.sr
@@ -8229,6 +8245,7 @@ def main():
                 y_other_harm,
                 args.enable_chord_analysis,
                 chord_cache_key,
+                args.chord_silence_db,
             )
             futs["drums"] = executor.submit(
                 _cached_analyze_drums,
@@ -9683,13 +9700,17 @@ def refine_chords_with_melody_bass(
     return merged
 
 
-def analyze_chords(y_other, sr, hop_length=512, y_harm=None, chord_analysis=True):
+def analyze_chords(y_other, sr, hop_length=512, y_harm=None, chord_analysis=True,
+                   silence_db=-38.0):
     """和弦：Chroma 時間平滑 + root bias + 低置信度保持上一和弦。
 
     當 chord_analysis=False 時，跳過 chroma CQT 與和弦辨識，
     只做 beat tracking，回傳 ([], beat_times, tempo)。
     這樣下游的 beat 選擇仍然有 other_beat_times 可用，
     但不會浪費時間計算 chords / 也不會產生和弦伴奏。
+
+    silence_db：一段的 y_other RMS 平均音量（dB）低於這個值時，視為
+    「這裡其實沒有聲音」，不產生和弦（見下方「靜音判斷」的說明）。
     """
     import librosa
     from scipy.ndimage import uniform_filter1d
@@ -9732,6 +9753,20 @@ def analyze_chords(y_other, sr, hop_length=512, y_harm=None, chord_analysis=True
     chroma_s = uniform_filter1d(chroma, size=smooth_frames, axis=1, mode="nearest")
     frame_times = np.arange(chroma_s.shape[1]) * hop_length / sr
 
+    # ------------------------------------------------------------
+    # 靜音判斷（獨立於 chroma 的真正音量）
+    # ------------------------------------------------------------
+    # librosa.feature.chroma_cqt 預設對每個 frame 做峰值正規化：就算
+    # 這段完全沒有聲音，極微小的噪音也會被放大成一個「看起來很有把握」
+    # 的和弦向量，下面 `norm <= 1e-9` 的檢查幾乎不會被觸發。
+    # 這裡改用獨立算出來的 RMS 音量判斷一段是否其實沒有聲音：
+    # 前奏/間奏/尾奏這類本來該是空的地方，不應該被生出和弦。
+    # silence_db 是一個經驗門檻，不同歌曲的響度不同，可用
+    # --chord-silence-db 調整；調太高會連真正安靜的樂段也被吃掉。
+    _rms = librosa.feature.rms(y=y_other, hop_length=hop_length)[0]
+    _rms_db = librosa.amplitude_to_db(_rms + 1e-8)
+    _rms_times = librosa.times_like(_rms, sr=sr, hop_length=hop_length)
+
     candidates = []
     chord_templates = (
         ("maj",   (0, 4, 7)),
@@ -9753,6 +9788,7 @@ def analyze_chords(y_other, sr, hop_length=512, y_harm=None, chord_analysis=True
     segs = np.unique(np.concatenate(([0.0], beat_times, [duration])))
     raw = []
     prev = None
+    silent_segs = 0
     for i in range(len(segs) - 1):
         s, e = float(segs[i]), float(segs[i + 1])
         if e - s < 0.05:
@@ -9760,6 +9796,15 @@ def analyze_chords(y_other, sr, hop_length=512, y_harm=None, chord_analysis=True
         mask = (frame_times >= s) & (frame_times < e)
         if not mask.any():
             continue
+
+        rmask = (_rms_times >= s) & (_rms_times < e)
+        seg_db = float(_rms_db[rmask].mean()) if rmask.any() else -120.0
+        if seg_db < silence_db:
+            # 這段的 Other 音量太低，當作沒有聲音：不指派和弦，
+            # 也不更新 prev（下一個有聲音的段落照常正常判斷）。
+            silent_segs += 1
+            continue
+
         vec = chroma_s[:, mask].mean(axis=1)
         norm = np.linalg.norm(vec)
         if norm <= 1e-9:
@@ -9790,7 +9835,11 @@ def analyze_chords(y_other, sr, hop_length=512, y_harm=None, chord_analysis=True
             merged.append(c)
 
     print(f"  Tempo 約 {tempo_val:.1f} BPM")
-    print(f"  偵測到 {len(merged)} 個和弦區段")
+    print(
+        f"  偵測到 {len(merged)} 個和弦區段"
+        + (f"（另有 {silent_segs} 段音量低於 {silence_db:g} dB，"
+           f"視為無聲、不生成和弦）" if silent_segs else "")
+    )
     return merged, beat_times, tempo_val
 
 
@@ -10059,18 +10108,21 @@ def _load_chords_npz(path):
         cached.close()
 
 
-def _cached_analyze_chords(y_other, sr, y_harm, chord_analysis, cache_key):
+def _cached_analyze_chords(y_other, sr, y_harm, chord_analysis, cache_key,
+                           silence_db=-38.0):
     """和弦/節拍分析 + 持久化快取（key 已含全部相關參數）。"""
     if not cache_key:
         return analyze_chords(
-            y_other, sr, y_harm=y_harm, chord_analysis=chord_analysis
+            y_other, sr, y_harm=y_harm, chord_analysis=chord_analysis,
+            silence_db=silence_db,
         )
     path = os.path.join(_ensure_cache_dir("chords"), cache_key + ".npz")
     if os.path.isfile(path):
         print("  和弦/節拍 → 使用持久化快取（跳過 chroma/beat 分析）")
         return _load_chords_npz(path)
     result = analyze_chords(
-        y_other, sr, y_harm=y_harm, chord_analysis=chord_analysis
+        y_other, sr, y_harm=y_harm, chord_analysis=chord_analysis,
+        silence_db=silence_db,
     )
     _save_chords_npz(path, *result)
     return result
