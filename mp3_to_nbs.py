@@ -6707,18 +6707,28 @@ def main():
     bass_group.add_argument(
         "--bass-backend",
         choices=["pyin", "rmvpe"],
-        default="pyin",
+        default="rmvpe",
         help=(
             "Bass 音高追蹤引擎（預設: %(default)s）。"
-            "pyin = 原本 librosa.pYIN（CPU，慢但為現行基準）；"
-            "rmvpe = 復用 RMVPE 模型跑 bass stem（GPU 上快很多，"
-            "輸出與 pYIN 略有差異，適合 A/B 比較）。"
+            "rmvpe = 復用 RMVPE 模型跑 bass stem（GPU 上快很多，預設）；"
+            "pyin = 原本 librosa.pYIN（CPU，慢，可用 --bass-backend pyin 切回做 A/B 比較）。"
         ),
     )
 
     # ========================================================
     # 和弦分析參數
     # ========================================================
+
+    ap.add_argument(
+        "--instrumental-pitch",
+        choices=["pyin", "rmvpe"],
+        default="rmvpe",
+        help=(
+            "純音樂旋律（人聲缺席段落從 Other 找旋律）用的音高追蹤。"
+            "rmvpe（預設）= 用 RMVPE 在 Other harmonic 上出 F0，CUDA 可用時在 GPU 跑，"
+            "失敗自動退回 pyin；pyin = 原本的 librosa.pYIN（CPU，較慢）。"
+        ),
+    )
 
     chord_group = ap.add_argument_group(
         "和弦分析參數"
@@ -8114,7 +8124,7 @@ def main():
         # --------------------------------------------------
         # Bass 後端選擇（預設 pyin，輸出不變；rmvpe 復用主唱 ONNX 模型）
         # --------------------------------------------------
-        bass_backend = getattr(args, "bass_backend", "pyin")
+        bass_backend = getattr(args, "bass_backend", "rmvpe")
         if bass_backend == "rmvpe":
             print("  Bass 後端：RMVPE（與主唱共用 ONNX 模型）")
             bass_fn = extract_melody_notes_rmvpe
@@ -8237,6 +8247,10 @@ def main():
                     hop_length=256,
                     octave_shift=args.other_octave_shift,
                     y_harm=y_other_harm,
+                    pitch_backend=args.instrumental_pitch,
+                    device=args.device,
+                    model_path=args.melody_rmvpe_model,
+                    is_half=args.melody_rmvpe_half,
                 )
             futs["chord"] = executor.submit(
                 _cached_analyze_chords,
@@ -10168,6 +10182,45 @@ def _cached_analyze_drums(y_drums, sr, cache_key):
     return result
 
 
+def _rmvpe_f0_on_grid(
+    y_harm, sr, hop_length, fmin_hz, fmax_hz,
+    conf_thresh=0.05, device=None, model_path=None, is_half=False,
+):
+    """用 RMVPE 對 Other harmonic stem 出 F0，並對齊到 pYIN 的 frame 網格。
+
+    回傳 (f0, voiced_flag, voiced_prob)，長度與 pYIN 相同：1 + len(y)//hop。
+    RMVPE 的時間軸是 10 ms（16 kHz 內部），這裡用最近鄰取值，不做平滑。
+    信心值低於 conf_thresh、或超出 fmin/fmax 範圍的 frame 視為無聲。
+    """
+    import librosa
+
+    y = np.asarray(y_harm, dtype=np.float32)
+    n_frames = 1 + len(y) // hop_length
+    grid = np.arange(n_frames) * hop_length / float(sr)
+
+    model = _get_rmvpe_model(device=device, model_path=model_path, is_half=is_half)
+    y16 = librosa.resample(y, orig_sr=sr, target_sr=16000) if sr != 16000 else y
+    times, freq, conf, _act = model.predict(audio=y16, sr=16000)
+    times = np.asarray(times, dtype=np.float64).reshape(-1)
+    freq = np.asarray(freq, dtype=np.float64).reshape(-1)
+    conf = np.asarray(conf, dtype=np.float64).reshape(-1)
+    m = min(len(times), len(freq), len(conf))
+    if m == 0:
+        return (np.full(n_frames, np.nan), np.zeros(n_frames, dtype=bool),
+                np.zeros(n_frames))
+    times, freq, conf = times[:m], freq[:m], conf[:m]
+
+    hi = np.clip(np.searchsorted(times, grid), 0, m - 1)
+    lo = np.clip(hi - 1, 0, m - 1)
+    pick = np.where(np.abs(times[lo] - grid) <= np.abs(times[hi] - grid), lo, hi)
+    f = freq[pick]
+    c = conf[pick]
+    voiced = (c >= conf_thresh) & np.isfinite(f) & (f > 0) \
+        & (f >= fmin_hz) & (f <= fmax_hz)
+    f0 = np.where(voiced, f, np.nan)
+    return f0, voiced, np.where(np.isfinite(c), c, 0.0)
+
+
 def extract_instrumental_melody(
     y_other,
     y_vocal,
@@ -10177,8 +10230,18 @@ def extract_instrumental_melody(
     fmin_note="C2",
     fmax_note="C7",
     y_harm=None,
+    pitch_backend="rmvpe",
+    device=None,
+    model_path=None,
+    is_half=False,
+    rmvpe_conf_thresh=0.05,
 ):
-    """在 vocals 缺席的區段，從 Other stem 找最突出的單音旋律。"""
+    """在 vocals 缺席的區段，從 Other stem 找最突出的單音旋律。
+
+    pitch_backend="rmvpe"（預設）：用 RMVPE（CUDA 若可用）對 Other harmonic 出 F0。
+    pitch_backend="pyin"：原本的 librosa.pyin（CPU，較慢）。
+    RMVPE 失敗時自動退回 pYIN，不會讓整個轉譜中斷。
+    """
     import librosa
     from scipy.ndimage import median_filter
 
@@ -10194,16 +10257,35 @@ def extract_instrumental_melody(
     else:
         print("  Other 純音樂旋律 → 使用已快取的 harmonic stem")
 
-    # 用 pYIN 找「可能的主旋律」。這裡不直接整段採用，
+    # 找「可能的主旋律」（RMVPE 或 pYIN）。這裡不直接整段採用，
     # 後面還會用 vocals 能量把真正的人聲區段排除。
-    f0, voiced_flag, voiced_prob = _pyin_instrumental_gated(
-        y_harm,
-        y_vocal,
-        sr,
-        fmin_note,
-        fmax_note,
-        hop_length,
-    )
+    f0 = voiced_flag = voiced_prob = None
+    if pitch_backend == "rmvpe":
+        try:
+            _fmin_hz = float(librosa.note_to_hz(fmin_note))
+            _fmax_hz = float(librosa.note_to_hz(fmax_note))
+            f0, voiced_flag, voiced_prob = _rmvpe_f0_on_grid(
+                y_harm, sr, hop_length, _fmin_hz, _fmax_hz,
+                conf_thresh=rmvpe_conf_thresh,
+                device=device, model_path=model_path, is_half=is_half,
+            )
+            print(
+                f"  Other 純音樂旋律 → RMVPE 完成（有聲 frame "
+                f"{int(voiced_flag.sum())}/{len(voiced_flag)}，"
+                f"信心門檻 {rmvpe_conf_thresh:g}）"
+            )
+        except Exception as exc:
+            print(f"  Other 純音樂旋律 → RMVPE 失敗，改用 pYIN：{exc}")
+            f0 = None
+    if f0 is None:
+        f0, voiced_flag, voiced_prob = _pyin_instrumental_gated(
+            y_harm,
+            y_vocal,
+            sr,
+            fmin_note,
+            fmax_note,
+            hop_length,
+        )
 
     times = librosa.times_like(f0, sr=sr, hop_length=hop_length)
     other_valid = (
